@@ -2,7 +2,7 @@
 from setuptools import setup, find_packages
 
 setup(name='TornadoAsyncMemcache',
-      packages=find_packages(),
+      py_modules=['tornadoasyncmemcache'],
       version=0.1,
       description="Async driver for memcache and tornado.",
       author="David P. Novakovic",
