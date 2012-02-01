@@ -60,25 +60,78 @@ __version__   = "1.0"
 __copyright__ = "Copyright (C) 2003 Danga Interactive"
 __license__   = "Python"
 
+class TooManyClients(Exception):
+    pass
 
 class ClientPool(object):
-    def __init__(self,clients):
-        self.clients = collections.deque(clients)
-        self.used = collections.deque()
+
+    def __init__(self,
+                 servers,
+                 mincached = 0,
+                 maxcached = 0,
+                 maxclients = 0,
+                 *args, **kwargs):
+
+        assert isinstance(mincached, int)
+        assert isinstance(maxcached, int)
+        assert isinstance(maxclients, int)
+        if maxclients > 0:
+            assert maxclients >= mincached
+            assert maxclients >= maxcached
+        if maxcached > 0:
+            assert maxcached >= mincached
+
+        self._servers = servers
+        self._args, self._kwargs = args, kwargs
+        self._used = collections.deque()
+        self._maxclients = maxclients
+        self._mincached = mincached
+        self._maxcached = maxcached
+
+        self._clients = collections.deque(self._create_clients(mincached))
+
+    def _create_clients(self, n):
+        assert n >= 0
+        return [Client(self._servers, *self._args, **self._kwargs)
+                for x in xrange(n)]
+
+    def _do(self, cmd, *args, **kwargs):
+        if not self._clients:
+            if self._maxclients > 0 and (len(self._clients)
+                + len(self._used) >= self._maxclients):
+                raise TooManyClients("Max of %d clients is already reached"
+                                     % self._maxclients)
+            self._clients.append(self._create_clients(1)[0])
+        c = self._clients.popleft()
+        kwargs['callback'] = partial(self._gen_cb, c=c, _cb=kwargs['callback'])
+        self._used.append(c)
+        getattr(c, cmd)(*args, **kwargs)
         
     def get(self, *args, **kwargs):
-        c = self.clients.popleft()
-        kwargs['callback'] = partial(self._get_cb,c=c, _cb=kwargs['callback'])
-        self.used.append(c)
-        c.get(*args,**kwargs)
-        
-    def _get_cb(self,response, c, _cb, *args, **kwargs):
-        self.used.remove(c)
-        self.clients.append(c)
-        _cb(response, *args,**kwargs)
-        
-        
-        
+        self._do('get', *args, **kwargs)
+
+    def replace(self, *args, **kwargs):
+        self._do('replace', *args, **kwargs)
+
+    def decr(self, *args, **kwargs):
+        self._do('decr', *args, **kwargs)
+
+    def incr(self, *args, **kwargs):
+        self._do('incr', *args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        self._do('delete', *args, **kwargs)
+
+    def set(self, *args, **kwargs):
+        self._do('set', *args, **kwargs)
+
+    def _gen_cb(self, response, c, _cb, *args, **kwargs):
+        self._used.remove(c)
+        if self._maxcached == 0 or self._maxcached > len(self._clients):
+            self._clients.append(c)
+        else:
+            c.disconnect_all()
+        _cb(response, *args, **kwargs)
     
 
 class _Error(Exception):
@@ -598,4 +651,4 @@ if __name__ == "__main__":
 
 
 
-# vim: ts=4 sw=4 et :
+# vim: ts=4 sw=4 softtabstop=4 et :
