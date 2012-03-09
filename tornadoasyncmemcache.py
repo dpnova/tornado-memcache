@@ -57,6 +57,8 @@ class TooManyClients(Exception):
 
 class ClientPool(object):
 
+    CMDS = ('get', 'replace', 'set', 'decr', 'incr', 'delete')
+
     def __init__(self,
                  servers,
                  mincached = 0,
@@ -98,25 +100,13 @@ class ClientPool(object):
         kwargs['callback'] = partial(self._gen_cb, c=c, _cb=kwargs['callback'])
         self._used.append(c)
         getattr(c, cmd)(*args, **kwargs)
+
+    def __getattr__(self, name):
+        if name in self.CMDS:
+            return partial(self._do, name)
+        raise AttributeError("'%s' object has no attribute '%s'" %
+            (self.__class__.__name__, name))
         
-    def get(self, *args, **kwargs):
-        self._do('get', *args, **kwargs)
-
-    def replace(self, *args, **kwargs):
-        self._do('replace', *args, **kwargs)
-
-    def decr(self, *args, **kwargs):
-        self._do('decr', *args, **kwargs)
-
-    def incr(self, *args, **kwargs):
-        self._do('incr', *args, **kwargs)
-
-    def delete(self, *args, **kwargs):
-        self._do('delete', *args, **kwargs)
-
-    def set(self, *args, **kwargs):
-        self._do('set', *args, **kwargs)
-
     def _gen_cb(self, response, c, _cb, *args, **kwargs):
         self._used.remove(c)
         if self._maxcached == 0 or self._maxcached > len(self._clients):
