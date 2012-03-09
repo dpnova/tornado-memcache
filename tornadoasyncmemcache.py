@@ -1,46 +1,38 @@
 #!/usr/bin/env python
 
 """
-client module for memcached (memory cache daemon)
-
-Overview
+Example using ClientPool
 ========
 
-See U{the MemCached homepage<http://www.danga.com/memcached>} for more about memcached.
-
-Usage summary
-=============
-
-This should give you a feel for how this module operates::
-
-    import memcache
-    mc = memcache.Client(['127.0.0.1:11211'], debug=0)
-
-    mc.set("some_key", "Some value")
-    value = mc.get("some_key")
-
-    mc.set("another_key", 3)
-    mc.delete("another_key")
+    import tornado.ioloop
+    import tornado.web
+    import tornadoasyncmemcache as memcache
+    import time
     
-    mc.set("key", "1")   # note that the key used for incr/decr must be a string.
-    mc.incr("key")
-    mc.decr("key")
+    ccs = memcache.ClientPool(['127.0.0.1:11211'], maxclients=100)
+    
+    class MainHandler(tornado.web.RequestHandler):
+      @tornado.web.asynchronous
+      def get(self):
+        time_str = time.strftime('%Y-%m-%d %H:%M:%S')
+        ccs.set('test_data', 'Hello world @ %s' % time_str,
+                callback=self._get_start)
+    
+      def _get_start(self, data):
+        ccs.get('test_data', callback=self._get_end)
+    
+      def _get_end(self, data):
+        self.write(data)
+        self.finish()
+    
+    application = tornado.web.Application([
+      (r"/", MainHandler),
+    ])
+    
+    if __name__ == "__main__":
+      application.listen(8888)
+      tornado.ioloop.IOLoop.instance().start()
 
-The standard way to use memcache with a database is like this::
-
-    key = derive_key(obj)
-    obj = mc.get(key)
-    if not obj:
-        obj = backend_api.get(...)
-        mc.set(obj)
-
-    # we now have obj, and future passes through this code
-    # will use the object from the cache.
-
-Detailed Documentation
-======================
-
-More detailed documentation is available in the L{Client} class.
 """
 import weakref
 import sys
