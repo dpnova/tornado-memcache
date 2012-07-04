@@ -66,6 +66,12 @@ __version__   = "1.0"
 __copyright__ = "Copyright (C) 2003 Danga Interactive"
 __license__   = "Python"
 
+SERVER_MAX_KEY_LENGTH = 250
+#  Storing values larger than 1MB requires recompiling memcached.  If you do,
+#  this value can be changed by doing "memcache.SERVER_MAX_VALUE_LENGTH = N"
+#  after importing this module.
+SERVER_MAX_VALUE_LENGTH = 1024*1024
+
 class TooManyClients(Exception):
     pass
 
@@ -78,11 +84,6 @@ class ClientPool(object):
                  mincached = 0,
                  maxcached = 0,
                  maxclients = 0,
-                 pickleProtocol = 0,
-                 pickler=pickle.Pickler,
-                 unpickler=pickle.Unpickler,
-                 pload=None,
-                 pid=None,
                  *args, **kwargs):
 
         assert isinstance(mincached, int)
@@ -102,21 +103,6 @@ class ClientPool(object):
         self._maxcached = maxcached
 
         self._clients = collections.deque(self._create_clients(mincached))
-
-        # Allow users to modify pickling/unpickling behavior
-        self.pickleProtocol = pickleProtocol
-        self.pickler = pickler
-        self.unpickler = unpickler
-        self.persistent_load = pload
-        self.persistent_id = pid
-
-        #  figure out the pickler style
-        file = StringIO()
-        try:
-            pickler = self.pickler(file, protocol = self.pickleProtocol)
-            self.picklerIsKeyword = True
-        except TypeError:
-            self.picklerIsKeyword = False
 
     def _create_clients(self, n):
         assert n >= 0
@@ -181,6 +167,19 @@ class Client(object):
 
     _SERVER_RETRIES = 10  # how many times to try finding a free server.
     
+    # exceptions for Client
+    class MemcachedKeyError(Exception):
+        pass
+    class MemcachedKeyLengthError(MemcachedKeyError):
+        pass
+    class MemcachedKeyCharacterError(MemcachedKeyError):
+        pass
+    class MemcachedKeyNoneError(MemcachedKeyError):
+        pass
+    class MemcachedKeyTypeError(MemcachedKeyError):
+        pass
+    class MemcachedStringEncodingError(Exception):
+        pass
     
     _ASYNC_CLIENTS = weakref.WeakKeyDictionary()
 
@@ -199,7 +198,14 @@ class Client(object):
 #            cls._ASYNC_CLIENTS[io_loop] = instance
 #            return instance
     
-    def __init__(self, servers, debug=0, io_loop=None):
+    def __init__(self, servers, debug=0, io_loop=None,
+                 pickleProtocol=0,
+                 pickler=pickle.Pickler,
+                 unpickler=pickle.Unpickler,
+                 pload=None,
+                 pid=None,
+                 server_max_key_length=SERVER_MAX_KEY_LENGTH,
+                 server_max_value_length=SERVER_MAX_VALUE_LENGTH):
         io_loop = io_loop or ioloop.IOLoop.instance()
         self.io_loop = io_loop
         self.set_servers(servers)
@@ -207,6 +213,23 @@ class Client(object):
         self.stats = {}
         self.servers
         self._ASYNC_CLIENTS[io_loop] = self
+
+        # Allow users to modify pickling/unpickling behavior
+        self.pickleProtocol = pickleProtocol
+        self.pickler = pickler
+        self.unpickler = unpickler
+        self.persistent_load = pload
+        self.persistent_id = pid
+        self.server_max_key_length = server_max_key_length
+        self.server_max_value_length = server_max_value_length
+
+        #  figure out the pickler style
+        file = StringIO()
+        try:
+            pickler = self.pickler(file, protocol = self.pickleProtocol)
+            self.picklerIsKeyword = True
+        except TypeError:
+            self.picklerIsKeyword = False
 
 #    def __init__(self, servers, debug=0):
 #        """
@@ -281,6 +304,7 @@ class Client(object):
         @return: Nonzero on success.
         @rtype: int
         '''
+        self.check_key(key)
         server, key = self._get_server(key)
         if not server:
             self.finish(partial(callback,0))
@@ -339,6 +363,7 @@ class Client(object):
         self._incrdecr("decr", key, delta, callback=callback)
 
     def _incrdecr(self, cmd, key, delta, callback):
+        self.check_key(key)
         server, key = self._get_server(key)
         if not server:
             self.finish(partial(callback, 0))
@@ -392,6 +417,7 @@ class Client(object):
         self._set("set", key, val, time, min_compress_len, callback)
     
     def _set(self, cmd, key, val, time, min_compress_len, callback):
+        self.check_key(key)
         server, key = self._get_server(key)
         if not server:
             self.finish(partial(callback,0))
@@ -432,6 +458,12 @@ class Client(object):
                 flags |= Client._FLAG_COMPRESSED
                 val = comp_val
 
+        #  silently do not store if value length exceeds maximum
+        if self.server_max_value_length != 0 and \
+           len(val) > self.server_max_value_length:
+            self.finish(partial(callback,None))
+            return
+
         fullcmd = "%s %s %d %d %d\r\n%s" % (cmd, key, flags, time, len(val), val)
         
         server.send_cmd(fullcmd, callback=partial(self._set_send_cb, server=server, callback=callback))
@@ -448,6 +480,7 @@ class Client(object):
         
         @return: The value or None.
         '''
+        self.check_key(key)
         server, key = self._get_server(key)
         if not server:
             return None
@@ -537,6 +570,24 @@ class Client(object):
         callback()
 #        self.disconnect_all()
 
+    def check_key(self, key, key_extra_len=0):
+        """Checks sanity of key.  Fails if:
+            Key length is > SERVER_MAX_KEY_LENGTH (Raises MemcachedKeyLength).
+            Contains control characters  (Raises MemcachedKeyCharacterError).
+            Is not a string (Raises MemcachedStringEncodingError)
+            Is an unicode string (Raises MemcachedStringEncodingError)
+            Is not a string (Raises MemcachedKeyError)
+            Is None (Raises MemcachedKeyError)
+        """
+        if isinstance(key, tuple): key = key[1]
+        if not key:
+            raise Client.MemcachedKeyNoneError("Key is None")
+        if isinstance(key, unicode):
+            raise Client.MemcachedStringEncodingError(
+                    "Keys must be str()'s, not unicode.  Convert your unicode "
+                    "strings using mystring.encode(charset)!")
+        if not isinstance(key, str):
+            raise Client.MemcachedKeyTypeError("Key must be str()'s")
     
 class _Host:
     _DEAD_RETRY = 30  # number of seconds before retrying a dead server.
