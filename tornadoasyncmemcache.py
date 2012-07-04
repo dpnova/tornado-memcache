@@ -47,6 +47,15 @@ try:
 except ImportError:
     import pickle
 
+try:
+    from zlib import compress, decompress
+    _supports_compress = True
+except ImportError:
+    _supports_compress = False
+    # quickly define a decompress just in case we recv compressed data.
+    def decompress(val):
+        raise _Error("received compressed data but I don't support compression (import error)")
+
 __author__    = "Tornadoified: David Novakovic dpn@dpn.name, original code: Evan Martin <martine@danga.com>"
 __version__   = "1.0"
 __copyright__ = "Copyright (C) 2003 Danga Interactive"
@@ -143,6 +152,7 @@ class Client(object):
     _FLAG_PICKLE  = 1<<0
     _FLAG_INTEGER = 1<<1
     _FLAG_LONG    = 1<<2
+    _FLAG_COMPRESSED    = 1<<3
 
     _SERVER_RETRIES = 10  # how many times to try finding a free server.
     
@@ -322,7 +332,7 @@ class Client(object):
 #            server.mark_dead(msg[1])
 #            return None
 
-    def add(self, key, val, time=0, callback=None):
+    def add(self, key, val, time=0, min_compress_len=0, callback=None):
         '''
         Add new key with value.
         
@@ -331,8 +341,8 @@ class Client(object):
         @return: Nonzero on success.
         @rtype: int
         '''
-        self._set("add", key, val, time, callback)
-    def replace(self, key, val, time=0, callback=None):
+        self._set("add", key, val, time, min_compress_len, callback)
+    def replace(self, key, val, time=0, min_compress_len=0, callback=None):
         '''Replace existing key with value.
         
         Like L{set}, but only stores in memcache if the key already exists.  
@@ -341,8 +351,8 @@ class Client(object):
         @return: Nonzero on success.
         @rtype: int
         '''
-        self._set("replace", key, val, time, callback)
-    def set(self, key, val, time=0, callback=None):
+        self._set("replace", key, val, time, min_compress_len, callback)
+    def set(self, key, val, time=0, min_compress_len=0, callback=None):
         '''Unconditionally sets a key to a given value in the memcache.
 
         The C{key} can optionally be an tuple, with the first element being the
@@ -354,9 +364,9 @@ class Client(object):
         @return: Nonzero on success.
         @rtype: int
         '''
-        self._set("set", key, val, time, callback)
+        self._set("set", key, val, time, min_compress_len, callback)
     
-    def _set(self, cmd, key, val, time, callback):
+    def _set(self, cmd, key, val, time, min_compress_len, callback):
         server, key = self._get_server(key)
         if not server:
             self.finish(partial(callback,0))
@@ -369,13 +379,26 @@ class Client(object):
         elif isinstance(val, int):
             flags |= Client._FLAG_INTEGER
             val = "%d" % val
+            min_compress_len = 0
         elif isinstance(val, long):
             flags |= Client._FLAG_LONG
             val = "%d" % val
+            min_compress_len = 0
         else:
             flags |= Client._FLAG_PICKLE
             val = pickle.dumps(val, 2)
         
+        lv = len(val)
+        # We should try to compress if min_compress_len > 0 and we could
+        # import zlib and this string is longer than our min threshold.
+        if min_compress_len and _supports_compress and lv > min_compress_len:
+            comp_val = compress(val)
+            # Only retain the result if the compression result is smaller
+            # than the original.
+            if len(comp_val) < lv:
+                flags |= Client._FLAG_COMPRESSED
+                val = comp_val
+
         fullcmd = "%s %s %d %d %d\r\n%s" % (cmd, key, flags, time, len(val), val)
         
         server.send_cmd(fullcmd, callback=partial(self._set_send_cb, server=server, callback=callback))
@@ -452,7 +475,11 @@ class Client(object):
         if len(buf) == rlen:
             buf = buf[:-2]  # strip \r\n
 
-        if flags == 0:
+        if flags & Client._FLAG_COMPRESSED:
+            buf = decompress(buf)
+
+        if flags == 0 or flags == Client._FLAG_COMPRESSED:
+            # Either a bare string or a compressed string now decompressed...
             val = buf
         elif flags & Client._FLAG_INTEGER:
             val = int(buf)
