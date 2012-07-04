@@ -73,6 +73,11 @@ class ClientPool(object):
                  mincached = 0,
                  maxcached = 0,
                  maxclients = 0,
+                 pickleProtocol = 0,
+                 pickler=pickle.Pickler,
+                 unpickler=pickle.Unpickler,
+                 pload=None,
+                 pid=None,
                  *args, **kwargs):
 
         assert isinstance(mincached, int)
@@ -92,6 +97,21 @@ class ClientPool(object):
         self._maxcached = maxcached
 
         self._clients = collections.deque(self._create_clients(mincached))
+
+        # Allow users to modify pickling/unpickling behavior
+        self.pickleProtocol = pickleProtocol
+        self.pickler = pickler
+        self.unpickler = unpickler
+        self.persistent_load = pload
+        self.persistent_id = pid
+
+        #  figure out the pickler style
+        file = StringIO()
+        try:
+            pickler = self.pickler(file, protocol = self.pickleProtocol)
+            self.picklerIsKeyword = True
+        except TypeError:
+            self.picklerIsKeyword = False
 
     def _create_clients(self, n):
         assert n >= 0
@@ -386,7 +406,15 @@ class Client(object):
             min_compress_len = 0
         else:
             flags |= Client._FLAG_PICKLE
-            val = pickle.dumps(val, 2)
+            file = StringIO()
+            if self.picklerIsKeyword:
+                pickler = self.pickler(file, protocol = self.pickleProtocol)
+            else:
+                pickler = self.pickler(file, self.pickleProtocol)
+            if self.persistent_id:
+                pickler.persistent_id = self.persistent_id
+            pickler.dump(val)
+            val = file.getvalue()
         
         lv = len(val)
         # We should try to compress if min_compress_len > 0 and we could
@@ -486,7 +514,15 @@ class Client(object):
         elif flags & Client._FLAG_LONG:
             val = long(buf)
         elif flags & Client._FLAG_PICKLE:
-            val = pickle.loads(buf)
+            try:
+                file = StringIO(buf)
+                unpickler = self.unpickler(file)
+                if self.persistent_load:
+                    unpickler.persistent_load = self.persistent_load
+                val = unpickler.load()
+            except Exception, e:
+                self.debuglog('Pickle error: %s\n' % e)
+                return None
         else:
             self.debuglog("unknown flags on get: %x\n" % flags)
 
