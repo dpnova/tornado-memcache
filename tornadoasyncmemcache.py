@@ -56,6 +56,11 @@ except ImportError:
     def decompress(val):
         raise _Error("received compressed data but I don't support compression (import error)")
 
+try:
+    from cStringIO import StringIO
+except ImportError:
+    from StringIO import StringIO
+
 __author__    = "Tornadoified: David Novakovic dpn@dpn.name, original code: Evan Martin <martine@danga.com>"
 __version__   = "1.0"
 __copyright__ = "Copyright (C) 2003 Danga Interactive"
