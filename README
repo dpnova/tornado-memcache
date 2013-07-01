@@ -1,4 +1,1 @@
 See the source for help: https://github.com/dpnova/tornado-memcache/blob/master/tornadoasyncmemcache.py
-
-The old example is over at my blog, but are a bit out of date: 
-    http://blog.dpn.name/asyncronous-memcache-driver-for-tornado
