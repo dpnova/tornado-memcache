@@ -250,7 +250,7 @@ class Client(object):
         if not server:
             self.finish(partial(callback,0))
         self._statlog('delete')
-        if time != None:
+        if time:
             cmd = "delete %s %d" % (key, time)
         else:
             cmd = "delete %s" % key
