@@ -41,7 +41,7 @@ import time
 import types
 from tornado import iostream, ioloop
 from functools import partial
-import collections
+#import collections
 try:
     import cPickle as pickle
 except ImportError:
@@ -80,7 +80,7 @@ class ClientPool(object):
 
         self._servers = servers
         self._args, self._kwargs = args, kwargs
-        self._used = collections.deque()
+        #self._used = collections.deque()
         self._maxclients = maxclients
         self._mincached = mincached
         self._maxcached = maxcached
