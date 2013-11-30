@@ -310,7 +310,7 @@ class Client(object):
         self._statlog(cmd)
         cmd = "%s %s %d" % (cmd, key, delta)
 
-        server.send_cmd(cmd, callback=partial(self._incrdecr_send_cb,server, callback))
+        server.send_cmd(cmd, callback=partial(self._send_incrdecr_check_cb,server, callback))
         
     def _send_incrdecr_cb(self, server, callback):
         server.readline(callback=partial(self._send_incrdecr_check_cb, callback=callback))
