@@ -546,7 +546,7 @@ class _Host:
         self.readline(partial(self._expect_cb, text=text, callback=callback))
         
     def _expect_cb(self, data, text, callback):
-        if data != text:
+        if data.rstrip() != text:
             self.debuglog("while expecting '%s', got unexpected response '%s'" % (text, data))
         callback(data)
     
