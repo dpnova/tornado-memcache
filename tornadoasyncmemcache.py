@@ -89,7 +89,7 @@ class ClientPool(object):
         return [Client(self._servers, *self._args, **self._kwargs)
                 for x in xrange(n)]
 
-    def _do(self, cmd, *args, **kwargs):
+    def _execute_command(self, cmd, *args, **kwargs):
         if not self._clients:
             if self._maxclients > 0 and (len(self._clients)
                 + len(self._used) >= self._maxclients):
@@ -100,6 +100,17 @@ class ClientPool(object):
         kwargs['callback'] = partial(self._gen_cb, c=c, _cb=kwargs['callback'])
         self._used.append(c)
         getattr(c, cmd)(*args, **kwargs)
+
+    #wraps _execute_command to reinitialize clients in case of server disconnection
+    def _do(self, cmd, *args, **kwargs):
+        try:
+            self._execute_command(cmd, *args, **kwargs)
+        except IOError as ex:
+            if ex.message == 'Stream is closed':
+                self._clients = collections.deque(self._create_clients(self._mincached))
+                self._execute_command(cmd, *args, **kwargs)
+            else:
+                raise ex
 
     def __getattr__(self, name):
         if name in self.CMDS:
