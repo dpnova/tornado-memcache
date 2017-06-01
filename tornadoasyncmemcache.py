@@ -47,10 +47,30 @@ try:
 except ImportError:
     import pickle
 
+try:
+    from zlib import compress, decompress
+    _supports_compress = True
+except ImportError:
+    _supports_compress = False
+    # quickly define a decompress just in case we recv compressed data.
+    def decompress(val):
+        raise _Error("received compressed data but I don't support compression (import error)")
+
+try:
+    from cStringIO import StringIO
+except ImportError:
+    from StringIO import StringIO
+
 __author__    = "Tornadoified: David Novakovic dpn@dpn.name, original code: Evan Martin <martine@danga.com>"
 __version__   = "1.0"
 __copyright__ = "Copyright (C) 2003 Danga Interactive"
 __license__   = "Python"
+
+SERVER_MAX_KEY_LENGTH = 250
+#  Storing values larger than 1MB requires recompiling memcached.  If you do,
+#  this value can be changed by doing "memcache.SERVER_MAX_VALUE_LENGTH = N"
+#  after importing this module.
+SERVER_MAX_VALUE_LENGTH = 1024*1024
 
 class TooManyClients(Exception):
     pass
@@ -154,9 +174,23 @@ class Client(object):
     _FLAG_PICKLE  = 1<<0
     _FLAG_INTEGER = 1<<1
     _FLAG_LONG    = 1<<2
+    _FLAG_COMPRESSED    = 1<<3
 
     _SERVER_RETRIES = 10  # how many times to try finding a free server.
     
+    # exceptions for Client
+    class MemcachedKeyError(Exception):
+        pass
+    class MemcachedKeyLengthError(MemcachedKeyError):
+        pass
+    class MemcachedKeyCharacterError(MemcachedKeyError):
+        pass
+    class MemcachedKeyNoneError(MemcachedKeyError):
+        pass
+    class MemcachedKeyTypeError(MemcachedKeyError):
+        pass
+    class MemcachedStringEncodingError(Exception):
+        pass
     
     _ASYNC_CLIENTS = weakref.WeakKeyDictionary()
 
@@ -175,7 +209,14 @@ class Client(object):
 #            cls._ASYNC_CLIENTS[io_loop] = instance
 #            return instance
     
-    def __init__(self, servers, debug=0, io_loop=None):
+    def __init__(self, servers, debug=0, io_loop=None,
+                 pickleProtocol=0,
+                 pickler=pickle.Pickler,
+                 unpickler=pickle.Unpickler,
+                 pload=None,
+                 pid=None,
+                 server_max_key_length=SERVER_MAX_KEY_LENGTH,
+                 server_max_value_length=SERVER_MAX_VALUE_LENGTH):
         io_loop = io_loop or ioloop.IOLoop.instance()
         self.io_loop = io_loop
         self.set_servers(servers)
@@ -183,6 +224,23 @@ class Client(object):
         self.stats = {}
         self.servers
         self._ASYNC_CLIENTS[io_loop] = self
+
+        # Allow users to modify pickling/unpickling behavior
+        self.pickleProtocol = pickleProtocol
+        self.pickler = pickler
+        self.unpickler = unpickler
+        self.persistent_load = pload
+        self.persistent_id = pid
+        self.server_max_key_length = server_max_key_length
+        self.server_max_value_length = server_max_value_length
+
+        #  figure out the pickler style
+        file = StringIO()
+        try:
+            pickler = self.pickler(file, protocol = self.pickleProtocol)
+            self.picklerIsKeyword = True
+        except TypeError:
+            self.picklerIsKeyword = False
 
 #    def __init__(self, servers, debug=0):
 #        """
@@ -257,6 +315,7 @@ class Client(object):
         @return: Nonzero on success.
         @rtype: int
         '''
+        self.check_key(key)
         server, key = self._get_server(key)
         if not server:
             self.finish(partial(callback,0))
@@ -315,6 +374,7 @@ class Client(object):
         self._incrdecr("decr", key, delta, callback=callback)
 
     def _incrdecr(self, cmd, key, delta, callback):
+        self.check_key(key)
         server, key = self._get_server(key)
         if not server:
             self.finish(partial(callback, 0))
@@ -333,7 +393,7 @@ class Client(object):
 #            server.mark_dead(msg[1])
 #            return None
 
-    def add(self, key, val, time=0, callback=None):
+    def add(self, key, val, time=0, min_compress_len=0, callback=None):
         '''
         Add new key with value.
         
@@ -342,8 +402,8 @@ class Client(object):
         @return: Nonzero on success.
         @rtype: int
         '''
-        self._set("add", key, val, time, callback)
-    def replace(self, key, val, time=0, callback=None):
+        self._set("add", key, val, time, min_compress_len, callback)
+    def replace(self, key, val, time=0, min_compress_len=0, callback=None):
         '''Replace existing key with value.
         
         Like L{set}, but only stores in memcache if the key already exists.  
@@ -352,8 +412,8 @@ class Client(object):
         @return: Nonzero on success.
         @rtype: int
         '''
-        self._set("replace", key, val, time, callback)
-    def set(self, key, val, time=0, callback=None):
+        self._set("replace", key, val, time, min_compress_len, callback)
+    def set(self, key, val, time=0, min_compress_len=0, callback=None):
         '''Unconditionally sets a key to a given value in the memcache.
 
         The C{key} can optionally be an tuple, with the first element being the
@@ -365,9 +425,10 @@ class Client(object):
         @return: Nonzero on success.
         @rtype: int
         '''
-        self._set("set", key, val, time, callback)
+        self._set("set", key, val, time, min_compress_len, callback)
     
-    def _set(self, cmd, key, val, time, callback):
+    def _set(self, cmd, key, val, time, min_compress_len, callback):
+        self.check_key(key)
         server, key = self._get_server(key)
         if not server:
             self.finish(partial(callback,0))
@@ -380,13 +441,40 @@ class Client(object):
         elif isinstance(val, int):
             flags |= Client._FLAG_INTEGER
             val = "%d" % val
+            min_compress_len = 0
         elif isinstance(val, long):
             flags |= Client._FLAG_LONG
             val = "%d" % val
+            min_compress_len = 0
         else:
             flags |= Client._FLAG_PICKLE
-            val = pickle.dumps(val, 2)
+            file = StringIO()
+            if self.picklerIsKeyword:
+                pickler = self.pickler(file, protocol = self.pickleProtocol)
+            else:
+                pickler = self.pickler(file, self.pickleProtocol)
+            if self.persistent_id:
+                pickler.persistent_id = self.persistent_id
+            pickler.dump(val)
+            val = file.getvalue()
         
+        lv = len(val)
+        # We should try to compress if min_compress_len > 0 and we could
+        # import zlib and this string is longer than our min threshold.
+        if min_compress_len and _supports_compress and lv > min_compress_len:
+            comp_val = compress(val)
+            # Only retain the result if the compression result is smaller
+            # than the original.
+            if len(comp_val) < lv:
+                flags |= Client._FLAG_COMPRESSED
+                val = comp_val
+
+        #  silently do not store if value length exceeds maximum
+        if self.server_max_value_length != 0 and \
+           len(val) > self.server_max_value_length:
+            self.finish(partial(callback,None))
+            return
+
         fullcmd = "%s %s %d %d %d\r\n%s" % (cmd, key, flags, time, len(val), val)
         
         server.send_cmd(fullcmd, callback=partial(self._set_send_cb, server=server, callback=callback))
@@ -403,6 +491,7 @@ class Client(object):
         
         @return: The value or None.
         '''
+        self.check_key(key)
         server, key = self._get_server(key)
         if not server:
             return None
@@ -463,14 +552,26 @@ class Client(object):
         if len(buf) == rlen:
             buf = buf[:-2]  # strip \r\n
 
-        if flags == 0:
+        if flags & Client._FLAG_COMPRESSED:
+            buf = decompress(buf)
+
+        if flags == 0 or flags == Client._FLAG_COMPRESSED:
+            # Either a bare string or a compressed string now decompressed...
             val = buf
         elif flags & Client._FLAG_INTEGER:
             val = int(buf)
         elif flags & Client._FLAG_LONG:
             val = long(buf)
         elif flags & Client._FLAG_PICKLE:
-            val = pickle.loads(buf)
+            try:
+                file = StringIO(buf)
+                unpickler = self.unpickler(file)
+                if self.persistent_load:
+                    unpickler.persistent_load = self.persistent_load
+                val = unpickler.load()
+            except Exception, e:
+                self.debuglog('Pickle error: %s\n' % e)
+                return None
         else:
             self.debuglog("unknown flags on get: %x\n" % flags)
 
@@ -480,6 +581,24 @@ class Client(object):
         callback()
 #        self.disconnect_all()
 
+    def check_key(self, key, key_extra_len=0):
+        """Checks sanity of key.  Fails if:
+            Key length is > SERVER_MAX_KEY_LENGTH (Raises MemcachedKeyLength).
+            Contains control characters  (Raises MemcachedKeyCharacterError).
+            Is not a string (Raises MemcachedStringEncodingError)
+            Is an unicode string (Raises MemcachedStringEncodingError)
+            Is not a string (Raises MemcachedKeyError)
+            Is None (Raises MemcachedKeyError)
+        """
+        if isinstance(key, tuple): key = key[1]
+        if not key:
+            raise Client.MemcachedKeyNoneError("Key is None")
+        if isinstance(key, unicode):
+            raise Client.MemcachedStringEncodingError(
+                    "Keys must be str()'s, not unicode.  Convert your unicode "
+                    "strings using mystring.encode(charset)!")
+        if not isinstance(key, str):
+            raise Client.MemcachedKeyTypeError("Key must be str()'s")
     
 class _Host:
     _DEAD_RETRY = 30  # number of seconds before retrying a dead server.
