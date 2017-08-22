@@ -8,27 +8,27 @@ Example using ClientPool
     import tornado.web
     import tornadoasyncmemcache as memcache
     import time
-    
+
     ccs = memcache.ClientPool(['127.0.0.1:11211'], maxclients=100)
-    
+
     class MainHandler(tornado.web.RequestHandler):
       @tornado.web.asynchronous
       def get(self):
         time_str = time.strftime('%Y-%m-%d %H:%M:%S')
         ccs.set('test_data', 'Hello world @ %s' % time_str,
                 callback=self._get_start)
-    
+
       def _get_start(self, data):
         ccs.get('test_data', callback=self._get_end)
-    
+
       def _get_end(self, data):
         self.write(data)
         self.finish()
-    
+
     application = tornado.web.Application([
       (r"/", MainHandler),
     ])
-    
+
     if __name__ == "__main__":
       application.listen(8888)
       tornado.ioloop.IOLoop.instance().start()
@@ -42,6 +42,9 @@ import types
 from tornado import iostream, ioloop
 from functools import partial
 import collections
+import functools
+import greenlet
+
 try:
     import cPickle as pickle
 except ImportError:
@@ -97,14 +100,14 @@ class ClientPool(object):
                                      % self._maxclients)
             self._clients.append(self._create_clients(1)[0])
         c = self._clients.popleft()
-        kwargs['callback'] = partial(self._gen_cb, c=c, _cb=kwargs['callback'])
         self._used.append(c)
-        getattr(c, cmd)(*args, **kwargs)
+        kwargs['callback'] = partial(self._gen_cb, c=c)
+        return getattr(c, cmd)(*args, **kwargs)
 
     #wraps _execute_command to reinitialize clients in case of server disconnection
     def _do(self, cmd, *args, **kwargs):
         try:
-            self._execute_command(cmd, *args, **kwargs)
+            return self._execute_command(cmd, *args, **kwargs)
         except IOError as ex:
             if ex.message == 'Stream is closed':
                 self._clients = collections.deque(self._create_clients(self._mincached))
@@ -117,15 +120,14 @@ class ClientPool(object):
             return partial(self._do, name)
         raise AttributeError("'%s' object has no attribute '%s'" %
             (self.__class__.__name__, name))
-        
-    def _gen_cb(self, response, c, _cb, *args, **kwargs):
+
+    def _gen_cb(self, response, c, *args, **kwargs):
         self._used.remove(c)
         if self._maxcached == 0 or self._maxcached > len(self._clients):
             self._clients.append(c)
         else:
             c.disconnect_all()
-        _cb(response, *args, **kwargs)
-    
+        return response
 
 class _Error(Exception):
     pass
@@ -133,7 +135,7 @@ class _Error(Exception):
 class Client(object):
     """
     Object representing a pool of memcache servers.
-    
+
     See L{memcache} for an overview.
 
     In all cases where a key is used, the key can be either:
@@ -156,27 +158,11 @@ class Client(object):
     _FLAG_LONG    = 1<<2
 
     _SERVER_RETRIES = 10  # how many times to try finding a free server.
-    
-    
+
     _ASYNC_CLIENTS = weakref.WeakKeyDictionary()
 
-#    def __new__(cls, servers, max_connections=1000, debug=0, io_loop=None):
-#        # There is one client per IOLoop since they share curl instances
-#        io_loop = io_loop or ioloop.IOLoop.instance()
-#        if io_loop in cls._ASYNC_CLIENTS:
-#            return cls._ASYNC_CLIENTS[io_loop]
-#        else:
-#            instance = super(Client, cls).__new__(cls)
-#            instance.io_loop = io_loop
-#            instance.set_servers(servers)
-#            instance.debug = debug
-#            instance.stats = {}
-#            instance.servers
-#            cls._ASYNC_CLIENTS[io_loop] = instance
-#            return instance
-    
     def __init__(self, servers, debug=0, io_loop=None):
-        io_loop = io_loop or ioloop.IOLoop.instance()
+        io_loop = io_loop or ioloop.IOLoop.current()
         self.io_loop = io_loop
         self.set_servers(servers)
         self.debug = debug
@@ -184,18 +170,6 @@ class Client(object):
         self.servers
         self._ASYNC_CLIENTS[io_loop] = self
 
-#    def __init__(self, servers, debug=0):
-#        """
-#        Create a new Client object with the given list of servers.
-#
-#        @param servers: C{servers} is passed to L{set_servers}.
-#        @param debug: whether to display error messages when a server can't be
-#        contacted.
-#        """
-#        self.set_servers(servers)
-#        self.debug = debug
-#        self.stats = {}
-    
     def set_servers(self, servers):
         """
         Set the pool of servers used by this client.
@@ -206,7 +180,7 @@ class Client(object):
             2. Tuples of the form C{("host:port", weight)}, where C{weight} is
             an integer weight value.
         """
-        self.servers = [_Host(s, self.debuglog) for s in servers]
+        self.servers = [MemcachedConnection(s, GreenletBoundedSemaphore(5)) for s in servers]
         self._init_buckets()
 
     def debuglog(self, str):
@@ -229,8 +203,7 @@ class Client(object):
     def _init_buckets(self):
         self.buckets = []
         for server in self.servers:
-            for i in range(server.weight):
-                self.buckets.append(server)
+            self.buckets.append(server)
 
     def _get_server(self, key):
         if type(key) == types.TupleType:
@@ -242,7 +215,6 @@ class Client(object):
         for i in range(Client._SERVER_RETRIES):
             server = self.buckets[serverhash % len(self.buckets)]
             if server.connect():
-#                print "(using server %s)" % server
                 return server, key
             serverhash = hash(str(serverhash) + str(i))
         return None, None
@@ -250,10 +222,10 @@ class Client(object):
     def disconnect_all(self):
         for s in self.servers:
             s.close_socket()
-    
+
     def delete(self, key, time=0, callback=None):
         '''Deletes a key from the memcache.
-        
+
         @return: Nonzero on success.
         @rtype: int
         '''
@@ -266,16 +238,10 @@ class Client(object):
         else:
             cmd = "delete %s" % key
 
-        server.send_cmd(cmd, callback=partial(self._delete_send_cb,server, callback))
-        
+        return server.send_cmd(cmd, callback=partial(self._delete_send_cb,server, callback))
+
     def _delete_send_cb(self, server, callback):
-        server.expect("DELETED",callback=partial(self._expect_cb, callback=callback))
-    
-        
-#        except socket.error, msg:
-#            server.mark_dead(msg[1])
-#            return 0
-#        return 1
+        return server.expect("DELETED",callback=partial(self._expect_cb, callback=callback))
 
     def incr(self, key, delta=1, callback=None):
         """
@@ -300,7 +266,7 @@ class Client(object):
         @return: New value after incrementing.
         @rtype: int
         """
-        self._incrdecr("incr", key, delta, callback=callback)
+        return self._incrdecr("incr", key, delta, callback=callback)
 
     def decr(self, key, delta=1, callback=None):
         """
@@ -312,7 +278,7 @@ class Client(object):
         @return: New value after decrementing.
         @rtype: int
         """
-        self._incrdecr("decr", key, delta, callback=callback)
+        return self._incrdecr("decr", key, delta, callback=callback)
 
     def _incrdecr(self, cmd, key, delta, callback):
         server, key = self._get_server(key)
@@ -321,38 +287,34 @@ class Client(object):
         self._statlog(cmd)
         cmd = "%s %s %d" % (cmd, key, delta)
 
-        server.send_cmd(cmd, callback=partial(self._send_incrdecr_check_cb,server, callback))
-        
+        return server.send_cmd(cmd, callback=partial(self._send_incrdecr_check_cb,server, callback))
+
     def _send_incrdecr_cb(self, server, callback):
-        server.readline(callback=partial(self._send_incrdecr_check_cb, callback=callback))
-    
+        return server.readline(callback=partial(self._send_incrdecr_check_cb, callback=callback))
+
     def _send_incrdecr_check_cb(self, line, callback):
-        self.finish(partial(callback,int(line)))
-        
-#        except socket.error, msg:
-#            server.mark_dead(msg[1])
-#            return None
+        return self.finish(partial(callback,int(line)))
 
     def add(self, key, val, time=0, callback=None):
         '''
         Add new key with value.
-        
+
         Like L{set}, but only stores in memcache if the key doesn't already exist.
 
         @return: Nonzero on success.
         @rtype: int
         '''
-        self._set("add", key, val, time, callback)
+        return self._set("add", key, val, time, callback)
     def replace(self, key, val, time=0, callback=None):
         '''Replace existing key with value.
-        
-        Like L{set}, but only stores in memcache if the key already exists.  
+
+        Like L{set}, but only stores in memcache if the key already exists.
         The opposite of L{add}.
 
         @return: Nonzero on success.
         @rtype: int
         '''
-        self._set("replace", key, val, time, callback)
+        return self._set("replace", key, val, time, callback)
     def set(self, key, val, time=0, callback=None):
         '''Unconditionally sets a key to a given value in the memcache.
 
@@ -365,8 +327,8 @@ class Client(object):
         @return: Nonzero on success.
         @rtype: int
         '''
-        self._set("set", key, val, time, callback)
-    
+        return self._set("set", key, val, time, callback)
+
     def _set(self, cmd, key, val, time, callback):
         server, key = self._get_server(key)
         if not server:
@@ -386,21 +348,17 @@ class Client(object):
         else:
             flags |= Client._FLAG_PICKLE
             val = pickle.dumps(val, 2)
-        
+
         fullcmd = "%s %s %d %d %d\r\n%s" % (cmd, key, flags, time, len(val), val)
-        
-        server.send_cmd(fullcmd, callback=partial(self._set_send_cb, server=server, callback=callback))
-        
+
+        return server.send_cmd(fullcmd, callback=partial(self._set_send_cb, server=server, callback=callback))
+
     def _set_send_cb(self, server, callback):
-        server.expect("STORED", callback=partial(self._expect_cb, value=None, callback=callback))
-#        except socket.error, msg:
-#            server.mark_dead(msg[1])
-#            return 0
-#        return 1
+        return server.expect("STORED", callback=partial(self._expect_cb, value=None, callback=callback))
 
     def get(self, key, callback):
         '''Retrieves a key from the memcache.
-        
+
         @return: The value or None.
         '''
         server, key = self._get_server(key)
@@ -409,53 +367,42 @@ class Client(object):
 
         self._statlog('get')
 
-        server.send_cmd("get %s" % key, partial(self._get_send_cb, server=server, callback=callback))
-        
+        return server.send_cmd("get %s" % key, partial(self._get_send_cb, server=server, callback=callback))
+
     def _get_send_cb(self, server, callback):
-        self._expectvalue(server, line=None, callback=partial(self._get_expectval_cb, server=server, callback=callback))
-    
+        return self._expectvalue(server, line=None, callback=partial(self._get_expectval_cb, server=server, callback=callback))
+
     def _get_expectval_cb(self, rkey, flags, rlen, server, callback):
         if not rkey:
-            self.finish(partial(callback,None))
-            return
-        self._recv_value(server, flags, rlen, partial(self._get_recv_cb, server=server, callback=callback))
-        
-    def _get_recv_cb(self, value, server, callback):
-        server.expect("END", partial(self._expect_cb, value=value, callback=callback))
-        
-    def _expect_cb(self, expected=None, value=None, callback=None):
-#        print "in expect cb"
-        self.finish(partial(callback,value))
-#        except (_Error, socket.error), msg:
-#            if type(msg) is types.TupleType:
-#                msg = msg[1]
-#            server.mark_dead(msg)
-#            return None
-#        return value
+            return self.finish(partial(callback,None))
+        return self._recv_value(server, flags, rlen, partial(self._get_recv_cb, server=server, callback=callback))
 
-    # commented out sendmulti, as it would bea easier for the caller
-    # to just send an appropriate callback with multipl requests.
+    def _get_recv_cb(self, value, server, callback):
+        return server.expect("END", partial(self._expect_cb, value=value, callback=callback))
+
+    def _expect_cb(self, expected=None, value=None, callback=None):
+        return self.finish(partial(callback,value))
 
     def _expectvalue(self, server, line=None, callback=None):
         if not line:
-            server.readline(partial(self._expectvalue_cb, callback=callback))
+            return server.readline(partial(self._expectvalue_cb, callback=callback))
         else:
-            self._expectvalue_cb(line, callback)
+            return self._expectvalue_cb(line, callback)
 
     def _expectvalue_cb(self, line, callback):
         if line[:5] == 'VALUE':
             resp, rkey, flags, len = line.split()
             flags = int(flags)
             rlen = int(len)
-            callback(rkey, flags, rlen)
+            return callback(rkey, flags, rlen)
         else:
-            callback(None, None, None)
+            return callback(None, None, None)
 
     def _recv_value(self, server, flags, rlen, callback):
         rlen += 2 # include \r\n
-        server.recv(rlen, partial(self._recv_value_cb,rlen=rlen, flags=flags, callback=callback))
-        
-        
+        return server.recv(rlen, partial(self._recv_value_cb,rlen=rlen, flags=flags, callback=callback))
+
+
     def _recv_value_cb(self, buf, flags, rlen, callback):
         if len(buf) != rlen:
             raise _Error("received %d bytes when expecting %d" % (len(buf), rlen))
@@ -474,37 +421,334 @@ class Client(object):
         else:
             self.debuglog("unknown flags on get: %x\n" % flags)
 
-        self.finish(partial(callback,val))
-        
+        return self.finish(partial(callback,val))
+
     def finish(self, callback):
-        callback()
+        return callback()
 #        self.disconnect_all()
 
-    
-class _Host:
-    _DEAD_RETRY = 30  # number of seconds before retrying a dead server.
+class MemcachedIOStream(iostream.IOStream):
+    def can_read_sync(self, num_bytes):
+        return self._read_buffer_size >= num_bytes
 
-    def __init__(self, host, debugfunc=None):
-        if isinstance(host, types.TupleType):
-            host = host[0]
-            self.weight = host[1]
+def _check_deadline(cleanup_cb=None):
+    gr = greenlet.getcurrent()
+    if hasattr(gr, 'is_deadlined') and \
+            gr.is_deadlined():
+        if cleanup_cb:
+            cleanup_cb()
+        try:
+            gr.do_deadline()
+        except AttributeError:
+            logging.exception(
+                'Greenlet %s has \'is_deadlined\' but not \'do_deadline\'')
+
+def green_sock_method(method):
+    """Wrap a GreenletSocket method to pause the current greenlet and arrange
+       for the greenlet to be resumed when non-blocking I/O has completed.
+    """
+    @functools.wraps(method)
+    def _green_sock_method(self, *args, **kwargs):
+        self.child_gr = greenlet.getcurrent()
+        main = self.child_gr.parent
+        assert main, "Should be on child greenlet"
+
+        # Run on main greenlet
+        def closed(gr):
+            # The child greenlet might have died, e.g.:
+            # - An operation raised an error within PyMongo
+            # - PyMongo closed the MotorSocket in response
+            # - GreenletSocket.close() closed the IOStream
+            # - IOStream scheduled this closed() function on the loop
+            # - PyMongo operation completed (with or without error) and
+            #       its greenlet terminated
+            # - IOLoop runs this function
+            if not gr.dead:
+                gr.throw(socket.error("Close called, killing mongo operation"))
+
+        # send the error to this greenlet if something goes wrong during the
+        # query
+        self.stream.set_close_callback(functools.partial(closed, self.child_gr))
+
+        try:
+            # Add timeout for closing non-blocking method call
+            if self.timeout and not self.timeout_handle:
+                self.timeout_handle = self.io_loop.add_timeout(
+                    time.time() + self.timeout, self._switch_and_close)
+
+            # method is GreenletSocket.send(), recv(), etc. method() begins a
+            # non-blocking operation on an IOStream and arranges for
+            # callback() to be executed on the main greenlet once the
+            # operation has completed.
+            method(self, *args, **kwargs)
+
+            # Pause child greenlet until resumed by main greenlet, which
+            # will pass the result of the socket operation (data for recv,
+            # number of bytes written for sendall) to us.
+            socket_result = main.switch()
+
+            return socket_result
+        except socket.error:
+            raise
+        except IOError, e:
+            # If IOStream raises generic IOError (e.g., if operation
+            # attempted on closed IOStream), then substitute socket.error,
+            # since socket.error is what PyMongo's built to handle. For
+            # example, PyMongo will catch socket.error, close the socket,
+            # and raise AutoReconnect.
+            raise socket.error(str(e))
+        finally:
+            # do this here in case main.switch throws
+
+            # Remove timeout handle if set, since we've completed call
+            if self.timeout_handle:
+                self.io_loop.remove_timeout(self.timeout_handle)
+                self.timeout_handle = None
+
+            # disable the callback to raise exception in this greenlet on socket
+            # close, since the greenlet won't be around to raise the exception
+            # in (and it'll be caught on the next query and raise an
+            # AutoReconnect, which gets handled properly)
+            self.stream.set_close_callback(None)
+
+            def cleanup_cb():
+                self.stream.close()
+                try:
+                    self.pool.release()
+                except weakref.ReferenceError:
+                    # pool was gc'ed
+                    pass
+
+            _check_deadline(cleanup_cb)
+
+    return _green_sock_method
+
+class GreenletSocket(object):
+    """Replace socket with a class that yields from the current greenlet, if
+    we're on a child greenlet, when making blocking calls, and uses Tornado
+    IOLoop to schedule child greenlet for resumption when I/O is ready.
+
+    We only implement those socket methods actually used by pymongo.
+    """
+    def __init__(self, sock, io_loop, use_ssl=False, pool_ref=None):
+        self.use_ssl = use_ssl
+        self.io_loop = io_loop
+        self.timeout = None
+        self.timeout_handle = None
+        self.pool_ref = pool_ref
+        if self.use_ssl:
+            raise Exception("SSL isn't supported")
         else:
-            self.weight = 1
+            self.stream = MemcachedIOStream(sock, io_loop=io_loop)
 
+    def setsockopt(self, *args, **kwargs):
+        self.stream.socket.setsockopt(*args, **kwargs)
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def _switch_and_close(self):
+        # called on timeout to switch back to child greenlet
+        self.close()
+        if self.child_gr is not None:
+            self.child_gr.throw(IOError("Socket timed out"))
+
+    @green_sock_method
+    def connect(self, pair):
+        # do the connect on the underlying socket asynchronously...
+        self.stream.connect(pair, greenlet.getcurrent().switch)
+
+    def write(self, data):
+        # do the send on the underlying socket synchronously...
+        try:
+            self.stream.write(data)
+        except IOError as e:
+            raise socket.error(str(e))
+
+        if self.stream.closed():
+            raise socket.error("connection closed")
+
+    def recv(self, num_bytes):
+        # if we have enough bytes in our local buffer, don't yield
+        if self.stream.can_read_sync(num_bytes):
+            return self.stream._consume(num_bytes)
+        # else yield while we wait on Mongo to send us more
+        else:
+            return self.recv_async(num_bytes)
+
+    @green_sock_method
+    def recv_async(self, num_bytes):
+        # do the recv on the underlying socket... come back to the current
+        # greenlet when it's done
+        return self.stream.read_bytes(num_bytes, greenlet.getcurrent().switch)
+
+    @green_sock_method
+    def read_until(self, *args, **kwargs):
+        return self.stream.read_until(*args, callback=greenlet.getcurrent().switch, **kwargs)
+
+    def close(self):
+        # since we're explicitly handling closing here, don't raise an exception
+        # via the callback
+        self.stream.set_close_callback(None)
+
+        sock = self.stream.socket
+        try:
+            try:
+                self.stream.close()
+            except KeyError:
+                # Tornado's _impl (epoll, kqueue, ...) has already removed this
+                # file descriptor from its dict.
+                pass
+        finally:
+            # Sometimes necessary to avoid ResourceWarnings in Python 3:
+            # specifically, if the fd is closed from the OS's view, then
+            # stream.close() throws an exception, but the socket still has an
+            # fd and so will print a ResourceWarning. In that case, calling
+            # sock.close() directly clears the fd and does not raise an error.
+            if sock:
+                sock.close()
+
+    def fileno(self):
+        return self.stream.socket.fileno()
+
+class GreenletSemaphore(object):
+    """
+        Tornado IOLoop+Greenlet-based Semaphore class
+    """
+
+    def __init__(self, value=1, io_loop=None):
+        if value < 0:
+            raise ValueError("semaphore initial value must be >= 0")
+        self._value = value
+        self._waiters = []
+        self._waiter_timeouts = {}
+
+        self._ioloop = io_loop if io_loop else ioloop.IOLoop.current()
+
+    def _handle_timeout(self, timeout_gr):
+        if len(self._waiters) > 1000:
+            import os
+            logging.error('waiters size: %s on pid: %s', len(self._waiters),
+                    os.getpid())
+        # should always be there, but add some safety just in case
+        if timeout_gr in self._waiters:
+            self._waiters.remove(timeout_gr)
+
+        if timeout_gr in self._waiter_timeouts:
+            self._waiter_timeouts.pop(timeout_gr)
+
+        timeout_gr.switch()
+
+    def acquire(self, blocking=True, timeout=None):
+        if not blocking and timeout is not None:
+            raise ValueError("can't specify timeout for non-blocking acquire")
+
+        current = greenlet.getcurrent()
+        parent = current.parent
+        assert parent, "Must be called on child greenlet"
+
+        start_time = time.time()
+
+        # if the semaphore has a postive value, subtract 1 and return True
+        if self._value > 0:
+            self._value -= 1
+            return True
+        elif not blocking:
+            # non-blocking mode, just return False
+            return False
+        # otherwise, we don't get the semaphore...
+        while True:
+            self._waiters.append(current)
+            if timeout:
+                callback = functools.partial(self._handle_timeout, current)
+                self._waiter_timeouts[current] = \
+                        self._ioloop.add_timeout(time.time() + timeout,
+                                                 callback)
+
+            # yield back to the parent, returning when someone releases the
+            # semaphore
+            #
+            # because of the async nature of the way we yield back, we're
+            # not guaranteed to actually *get* the semaphore after returning
+            # here (someone else could acquire() between the release() and
+            # this greenlet getting rescheduled). so we go back to the loop
+            # and try again.
+            #
+            # this design is not strictly fair and it's possible for
+            # greenlets to starve, but it strikes me as unlikely in
+            # practice.
+            try:
+                parent.switch()
+            finally:
+                # need to wake someone else up if we were the one
+                # given the semaphore
+                def _cleanup_cb():
+                    if self._value > 0:
+                        self._value -= 1
+                        self.release()
+                _check_deadline(_cleanup_cb)
+
+            if self._value > 0:
+                self._value -= 1
+                return True
+
+            # if we timed out, just return False instead of retrying
+            if timeout and (time.time() - start_time) >= timeout:
+                return False
+
+    __enter__ = acquire
+
+    def release(self):
+        self._value += 1
+
+        if self._waiters:
+            waiting_gr = self._waiters.pop(0)
+
+            # remove the timeout
+            if waiting_gr in self._waiter_timeouts:
+                timeout = self._waiter_timeouts.pop(waiting_gr)
+                self._ioloop.remove_timeout(timeout)
+
+            # schedule the waiting greenlet to try to acquire
+            self._ioloop.add_callback(waiting_gr.switch)
+
+    def __exit__(self, t, v, tb):
+        self.release()
+
+    @property
+    def counter(self):
+        return self._value
+
+
+class GreenletBoundedSemaphore(GreenletSemaphore):
+    """Semaphore that checks that # releases is <= # acquires"""
+    def __init__(self, value=1):
+        GreenletSemaphore.__init__(self, value)
+        self._initial_value = value
+
+    def release(self):
+        if self._value >= self._initial_value:
+            raise ValueError("Semaphore released too many times")
+        return GreenletSemaphore.release(self)
+
+class MemcachedConnection(object):
+
+    def __init__(self, host, pool, io_loop=None):
         if host.find(":") > 0:
             self.ip, self.port = host.split(":")
             self.port = int(self.port)
         else:
             self.ip, self.port = host, 11211
 
-        if not debugfunc:
-            debugfunc = lambda x: x
-        self.debuglog = debugfunc
-
+        self.conn_timeout = 5
+        self.net_timeout = 5
         self.deaduntil = 0
         self.socket = None
-        self.stream = None
-    
+        self.timeout = None
+        self.timeout_handle = None
+        self.io_loop = io_loop if io_loop else ioloop.IOLoop.current()
+        self.pool = pool
+
     def _check_dead(self):
         if self.deaduntil and self.deaduntil > time.time():
             return 1
@@ -517,53 +761,51 @@ class _Host:
         return 0
 
     def mark_dead(self, reason):
-        print "MemCache: %s: %s.  Marking dead." % (self, reason)
-        self.deaduntil = time.time() + _Host._DEAD_RETRY
+        self.deaduntil = time.time() + MemcachedConnection._DEAD_RETRY
         self.close_socket()
-        
+
     def _get_socket(self):
         if self._check_dead():
             return None
         if self.socket:
             return self.socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Python 2.3-ism:  s.settimeout(1)
-        try:
-            s.connect((self.ip, self.port))
-        except socket.error, msg:
-            self.mark_dead("connect: %s" % msg[1])
-            return None
-        self.socket = s
-        self.stream = iostream.IOStream(s)
-        self.stream.debug=True
-        return s
-    
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        green_sock = GreenletSocket(sock, self.io_loop, pool_ref=self.pool)
+
+        green_sock.settimeout(self.conn_timeout)
+        green_sock.connect((self.ip, self.port))
+        green_sock.settimeout(self.net_timeout)
+
+        self.socket = green_sock
+        return green_sock
+
     def close_socket(self):
         if self.socket:
-#            self.socket.close()
-            self.stream.close()
-            self.stream = None
+            self.socket.close()
             self.socket = None
 
     def send_cmd(self, cmd, callback):
-#        print "in sendcmd", repr(cmd), callback
-        self.stream.write(cmd+"\r\n", callback)
-        #self.socket.sendall(cmd + "\r\n")
+        self.socket.write(cmd+"\r\n")
+        return callback()
 
     def readline(self, callback):
-        self.stream.read_until("\r\n", callback)
+        resp = self.socket.read_until("\r\n")
+        return callback(resp)
 
     def expect(self, text, callback):
-        self.readline(partial(self._expect_cb, text=text, callback=callback))
-        
+        return self.readline(partial(self._expect_cb, text=text, callback=callback))
+
     def _expect_cb(self, data, text, callback):
         if data.rstrip() != text:
             self.debuglog("while expecting '%s', got unexpected response '%s'" % (text, data))
-        callback(data)
-    
+        return callback(data)
+
     def recv(self, rlen, callback):
-        self.stream.read_bytes(rlen, callback)
-        
+        resp = self.socket.recv(rlen)
+        return callback(resp)
+
     def __str__(self):
         d = ''
         if self.deaduntil:
@@ -610,7 +852,7 @@ if __name__ == "__main__":
             if isinstance(other, FooStruct):
                 return self.bar == other.bar
             return 0
-        
+
     test_setget("a_string", "some random string")
     test_setget("an_integer", 42)
     if test_setget("long", long(1<<30)):
