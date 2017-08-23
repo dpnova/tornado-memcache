@@ -55,78 +55,46 @@ __version__   = "1.0"
 __copyright__ = "Copyright (C) 2003 Danga Interactive"
 __license__   = "Python"
 
-class TooManyClients(Exception):
-    pass
-
-class ClientPool(object):
+class MemcachedClient(object):
 
     CMDS = ('get', 'replace', 'set', 'decr', 'incr', 'delete')
 
     def __init__(self,
-                 servers,
-                 mincached = 0,
-                 maxcached = 0,
-                 maxclients = 0,
-                 *args, **kwargs):
+                 server,
+                 pool_size=5):
 
-        assert isinstance(mincached, int)
-        assert isinstance(maxcached, int)
-        assert isinstance(maxclients, int)
-        if maxclients > 0:
-            assert maxclients >= mincached
-            assert maxclients >= maxcached
-        if maxcached > 0:
-            assert maxcached >= mincached
+        self._server = server
+        self._pool_size = pool_size
 
-        self._servers = servers
-        self._args, self._kwargs = args, kwargs
-        self._used = collections.deque()
-        self._maxclients = maxclients
-        self._mincached = mincached
-        self._maxcached = maxcached
+        self._clients = self._create_clients()
+        self.pool = GreenletBoundedSemaphore(self._pool_size)
 
-        self._clients = collections.deque(self._create_clients(mincached))
+    def _create_clients(self):
+        return collections.deque([Client(self._server) for i in xrange(self._pool_size)])
 
-    def _create_clients(self, n):
-        assert n >= 0
-        return [Client(self._servers, *self._args, **self._kwargs)
-                for x in xrange(n)]
-
-    def _execute_command(self, cmd, *args, **kwargs):
-        if not self._clients:
-            if self._maxclients > 0 and (len(self._clients)
-                + len(self._used) >= self._maxclients):
-                raise TooManyClients("Max of %d clients is already reached"
-                                     % self._maxclients)
-            self._clients.append(self._create_clients(1)[0])
-        c = self._clients.popleft()
-        self._used.append(c)
-        kwargs['callback'] = partial(self._gen_cb, c=c)
-        return getattr(c, cmd)(*args, **kwargs)
+    def _execute_command(self, client, cmd, *args, **kwargs):
+        kwargs['callback'] = partial(self._gen_cb, c=client)
+        return getattr(client, cmd)(*args, **kwargs)
 
     #wraps _execute_command to reinitialize clients in case of server disconnection
-    def _do(self, cmd, *args, **kwargs):
-        try:
-            return self._execute_command(cmd, *args, **kwargs)
-        except IOError as ex:
-            if ex.message == 'Stream is closed':
-                self._clients = collections.deque(self._create_clients(self._mincached))
-                self._execute_command(cmd, *args, **kwargs)
-            else:
-                raise ex
+    def do(self, cmd, *args, **kwargs):
+        if not self._clients:
+            self._clients = self._create_clients()
 
-    def __getattr__(self, name):
-        if name in self.CMDS:
-            return partial(self._do, name)
-        raise AttributeError("'%s' object has no attribute '%s'" %
-            (self.__class__.__name__, name))
+        try:
+            self.pool.acquire()
+            client = self._clients.popleft()
+            return self._execute_command(client, cmd, *args, **kwargs)
+        except IOError as e:
+            if e.message == 'Stream is closed':
+                client.reconnect()
+                return self._execute_command(client, cmd, *args, **kwargs)
+            raise
+        finally:
+            self._clients.append(client)
+            self.pool.release()
 
     def _gen_cb(self, response, c, *args, **kwargs):
-        self._used.remove(c)
-        if self._maxcached == 0 or self._maxcached > len(self._clients):
-            self._clients.append(c)
-        else:
-            c.disconnect_all()
         return response
 
 class _Error(Exception):
@@ -157,20 +125,12 @@ class Client(object):
     _FLAG_INTEGER = 1<<1
     _FLAG_LONG    = 1<<2
 
-    _SERVER_RETRIES = 10  # how many times to try finding a free server.
-
-    _ASYNC_CLIENTS = weakref.WeakKeyDictionary()
-
-    def __init__(self, servers, debug=0, io_loop=None):
+    def __init__(self, server, io_loop=None):
         io_loop = io_loop or ioloop.IOLoop.current()
         self.io_loop = io_loop
-        self.set_servers(servers)
-        self.debug = debug
-        self.stats = {}
-        self.servers
-        self._ASYNC_CLIENTS[io_loop] = self
+        self.set_server(server)
 
-    def set_servers(self, servers):
+    def set_server(self, server):
         """
         Set the pool of servers used by this client.
 
@@ -180,48 +140,15 @@ class Client(object):
             2. Tuples of the form C{("host:port", weight)}, where C{weight} is
             an integer weight value.
         """
-        self.servers = [MemcachedConnection(s, GreenletBoundedSemaphore(5)) for s in servers]
-        self._init_buckets()
-
-    def debuglog(self, str):
-        if self.debug:
-            sys.stderr.write("MemCached: %s\n" % str)
-
-    def _statlog(self, func):
-        if not self.stats.has_key(func):
-            self.stats[func] = 1
-        else:
-            self.stats[func] += 1
-
-    def forget_dead_hosts(self):
-        """
-        Reset every host in the pool to an "alive" state.
-        """
-        for s in self.servers:
-            s.dead_until = 0
-
-    def _init_buckets(self):
-        self.buckets = []
-        for server in self.servers:
-            self.buckets.append(server)
+        self.server = MemcachedConnection(server)
 
     def _get_server(self, key):
-        if type(key) == types.TupleType:
-            serverhash = key[0]
-            key = key[1]
-        else:
-            serverhash = hash(key)
+        if self.server.connect():
+            return self.server, key
 
-        for i in range(Client._SERVER_RETRIES):
-            server = self.buckets[serverhash % len(self.buckets)]
-            if server.connect():
-                return server, key
-            serverhash = hash(str(serverhash) + str(i))
-        return None, None
-
-    def disconnect_all(self):
-        for s in self.servers:
-            s.close_socket()
+    def reconnect(self):
+        self.server.close()
+        self.server.connect()
 
     def delete(self, key, time=0, callback=None):
         '''Deletes a key from the memcache.
@@ -232,7 +159,6 @@ class Client(object):
         server, key = self._get_server(key)
         if not server:
             self.finish(partial(callback,0))
-        self._statlog('delete')
         if time:
             cmd = "delete %s %d" % (key, time)
         else:
@@ -284,7 +210,6 @@ class Client(object):
         server, key = self._get_server(key)
         if not server:
             self.finish(partial(callback, 0))
-        self._statlog(cmd)
         cmd = "%s %s %d" % (cmd, key, delta)
 
         return server.send_cmd(cmd, callback=partial(self._send_incrdecr_check_cb,server, callback))
@@ -334,8 +259,6 @@ class Client(object):
         if not server:
             self.finish(partial(callback,0))
 
-        self._statlog(cmd)
-
         flags = 0
         if isinstance(val, types.StringTypes):
             pass
@@ -364,8 +287,6 @@ class Client(object):
         server, key = self._get_server(key)
         if not server:
             return None
-
-        self._statlog('get')
 
         return server.send_cmd("get %s" % key, partial(self._get_send_cb, server=server, callback=callback))
 
@@ -425,7 +346,6 @@ class Client(object):
 
     def finish(self, callback):
         return callback()
-#        self.disconnect_all()
 
 class MemcachedIOStream(iostream.IOStream):
     def can_read_sync(self, num_bytes):
@@ -464,7 +384,7 @@ def green_sock_method(method):
             #       its greenlet terminated
             # - IOLoop runs this function
             if not gr.dead:
-                gr.throw(socket.error("Close called, killing mongo operation"))
+                gr.throw(socket.error("Close called, killing memcached operation"))
 
         # send the error to this greenlet if something goes wrong during the
         # query
@@ -513,11 +433,6 @@ def green_sock_method(method):
 
             def cleanup_cb():
                 self.stream.close()
-                try:
-                    self.pool.release()
-                except weakref.ReferenceError:
-                    # pool was gc'ed
-                    pass
 
             _check_deadline(cleanup_cb)
 
@@ -530,12 +445,11 @@ class GreenletSocket(object):
 
     We only implement those socket methods actually used by pymongo.
     """
-    def __init__(self, sock, io_loop, use_ssl=False, pool_ref=None):
+    def __init__(self, sock, io_loop, use_ssl=False):
         self.use_ssl = use_ssl
         self.io_loop = io_loop
         self.timeout = None
         self.timeout_handle = None
-        self.pool_ref = pool_ref
         if self.use_ssl:
             raise Exception("SSL isn't supported")
         else:
@@ -733,7 +647,7 @@ class GreenletBoundedSemaphore(GreenletSemaphore):
 
 class MemcachedConnection(object):
 
-    def __init__(self, host, pool, io_loop=None):
+    def __init__(self, host, io_loop=None):
         if host.find(":") > 0:
             self.ip, self.port = host.split(":")
             self.port = int(self.port)
@@ -742,37 +656,23 @@ class MemcachedConnection(object):
 
         self.conn_timeout = 5
         self.net_timeout = 5
-        self.deaduntil = 0
         self.socket = None
         self.timeout = None
         self.timeout_handle = None
         self.io_loop = io_loop if io_loop else ioloop.IOLoop.current()
-        self.pool = pool
-
-    def _check_dead(self):
-        if self.deaduntil and self.deaduntil > time.time():
-            return 1
-        self.deaduntil = 0
-        return 0
 
     def connect(self):
         if self._get_socket():
             return 1
         return 0
 
-    def mark_dead(self, reason):
-        self.deaduntil = time.time() + MemcachedConnection._DEAD_RETRY
-        self.close_socket()
-
     def _get_socket(self):
-        if self._check_dead():
-            return None
         if self.socket:
             return self.socket
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        green_sock = GreenletSocket(sock, self.io_loop, pool_ref=self.pool)
+        green_sock = GreenletSocket(sock, self.io_loop)
 
         green_sock.settimeout(self.conn_timeout)
         green_sock.connect((self.ip, self.port))
