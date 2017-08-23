@@ -1,40 +1,5 @@
 #!/usr/bin/env python
 
-"""
-Example using ClientPool
-========
-
-    import tornado.ioloop
-    import tornado.web
-    import tornadoasyncmemcache as memcache
-    import time
-
-    ccs = memcache.ClientPool(['127.0.0.1:11211'], maxclients=100)
-
-    class MainHandler(tornado.web.RequestHandler):
-      @tornado.web.asynchronous
-      def get(self):
-        time_str = time.strftime('%Y-%m-%d %H:%M:%S')
-        ccs.set('test_data', 'Hello world @ %s' % time_str,
-                callback=self._get_start)
-
-      def _get_start(self, data):
-        ccs.get('test_data', callback=self._get_end)
-
-      def _get_end(self, data):
-        self.write(data)
-        self.finish()
-
-    application = tornado.web.Application([
-      (r"/", MainHandler),
-    ])
-
-    if __name__ == "__main__":
-      application.listen(8888)
-      tornado.ioloop.IOLoop.instance().start()
-
-"""
-import weakref
 import sys
 import socket
 import time
@@ -44,16 +9,7 @@ from functools import partial
 import collections
 import functools
 import greenlet
-
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
-
-__author__    = "Tornadoified: David Novakovic dpn@dpn.name, original code: Evan Martin <martine@danga.com>"
-__version__   = "1.0"
-__copyright__ = "Copyright (C) 2003 Danga Interactive"
-__license__   = "Python"
+import logging
 
 class MemcachedClient(object):
 
@@ -61,16 +17,25 @@ class MemcachedClient(object):
 
     def __init__(self,
                  server,
-                 pool_size=5):
+                 pool_size=5,
+                 wait_queue_timeout=5,
+                 connect_timeout=5,
+                 net_timeout=5):
 
         self._server = server
         self._pool_size = pool_size
+        self._wait_queue_timeout = 5
+        self._connect_timeout = 5
+        self._net_timeout = 5
 
         self._clients = self._create_clients()
         self.pool = GreenletBoundedSemaphore(self._pool_size)
 
     def _create_clients(self):
-        return collections.deque([Client(self._server) for i in xrange(self._pool_size)])
+        return collections.deque([
+            Client(self._server,
+                   connect_timeout=self._connect_timeout,
+                   net_timeout=self._net_timeout) for i in xrange(self._pool_size)])
 
     def _execute_command(self, client, cmd, *args, **kwargs):
         kwargs['callback'] = partial(self._gen_cb, c=client)
@@ -81,8 +46,10 @@ class MemcachedClient(object):
         if not self._clients:
             self._clients = self._create_clients()
 
+        if not self.pool.acquire(timeout=self._wait_queue_timeout):
+            raise Exception('Timed out waiting for connection')
+
         try:
-            self.pool.acquire()
             client = self._clients.popleft()
             return self._execute_command(client, cmd, *args, **kwargs)
         except IOError as e:
@@ -269,8 +236,9 @@ class Client(object):
             flags |= Client._FLAG_LONG
             val = "%d" % val
         else:
-            flags |= Client._FLAG_PICKLE
-            val = pickle.dumps(val, 2)
+            # A bit odd to silently string it, but that's what pymemcache
+            # does. Ideally we should be raising an exception here.
+            val = str(val)
 
         fullcmd = "%s %s %d %d %d\r\n%s" % (cmd, key, flags, time, len(val), val)
 
@@ -337,8 +305,6 @@ class Client(object):
             val = int(buf)
         elif flags & Client._FLAG_LONG:
             val = long(buf)
-        elif flags & Client._FLAG_PICKLE:
-            val = pickle.loads(buf)
         else:
             self.debuglog("unknown flags on get: %x\n" % flags)
 
@@ -711,79 +677,3 @@ class MemcachedConnection(object):
         if self.deaduntil:
             d = " (dead until %d)" % self.deaduntil
         return "%s:%d%s" % (self.ip, self.port, d)
-
-def _doctest():
-    import doctest, memcache
-    servers = ["127.0.0.1:11211"]
-    mc = Client(servers, debug=1)
-    globs = {"mc": mc}
-    return doctest.testmod(memcache, globs=globs)
-
-if __name__ == "__main__":
-    print "Testing docstrings..."
-    _doctest()
-    print "Running tests:"
-    print
-    #servers = ["127.0.0.1:11211", "127.0.0.1:11212"]
-    servers = ["127.0.0.1:11211"]
-    mc = Client(servers, debug=1)
-
-    def to_s(val):
-        if not isinstance(val, types.StringTypes):
-            return "%s (%s)" % (val, type(val))
-        return "%s" % val
-    def test_setget(key, val):
-        print "Testing set/get {'%s': %s} ..." % (to_s(key), to_s(val)),
-        mc.set(key, val)
-        newval = mc.get(key)
-        if newval == val:
-            print "OK"
-            return 1
-        else:
-            print "FAIL"
-            return 0
-
-    class FooStruct:
-        def __init__(self):
-            self.bar = "baz"
-        def __str__(self):
-            return "A FooStruct"
-        def __eq__(self, other):
-            if isinstance(other, FooStruct):
-                return self.bar == other.bar
-            return 0
-
-    test_setget("a_string", "some random string")
-    test_setget("an_integer", 42)
-    if test_setget("long", long(1<<30)):
-        print "Testing delete ...",
-        if mc.delete("long"):
-            print "OK"
-        else:
-            print "FAIL"
-    print "Testing get_multi ...",
-    print mc.get_multi(["a_string", "an_integer"])
-
-    print "Testing get(unknown value) ...",
-    print to_s(mc.get("unknown_value"))
-
-    f = FooStruct()
-    test_setget("foostruct", f)
-
-    print "Testing incr ...",
-    x = mc.incr("an_integer", 1)
-    if x == 43:
-        print "OK"
-    else:
-        print "FAIL"
-
-    print "Testing decr ...",
-    x = mc.decr("an_integer", 1)
-    if x == 42:
-        print "OK"
-    else:
-        print "FAIL"
-
-
-
-# vim: ts=4 sw=4 softtabstop=4 et :
