@@ -13,7 +13,9 @@ import logging
 
 class MemcachedClient(object):
 
-    CMDS = ('get', 'replace', 'set', 'decr', 'incr', 'delete')
+    CMDS = set(['get', 'replace', 'set', 'decr', 'incr', 'delete',
+            'get_many','set_many','append','prepend',
+            'delete_many', 'add','touch'])
 
     def __init__(self,
                  server,
@@ -43,11 +45,14 @@ class MemcachedClient(object):
 
     #wraps _execute_command to reinitialize clients in case of server disconnection
     def do(self, cmd, *args, **kwargs):
+        if cmd not in self.CMDS:
+            raise Exception('Command %s not supported' % cmd)
+
         if not self._clients:
             self._clients = self._create_clients()
 
         if not self.pool.acquire(timeout=self._wait_queue_timeout):
-            raise Exception('Timed out waiting for connection')
+            raise AsyncMemcachedException('Timed out waiting for connection')
 
         try:
             client = self._clients.popleft()
@@ -64,7 +69,7 @@ class MemcachedClient(object):
     def _gen_cb(self, response, c, *args, **kwargs):
         return response
 
-class _Error(Exception):
+class AsyncMemcachedException(Exception):
     pass
 
 class Client(object):
@@ -92,9 +97,11 @@ class Client(object):
     _FLAG_INTEGER = 1<<1
     _FLAG_LONG    = 1<<2
 
-    def __init__(self, server, io_loop=None):
+    def __init__(self, server, connect_timeout=5, net_timeout=5, io_loop=None):
         io_loop = io_loop or ioloop.IOLoop.current()
         self.io_loop = io_loop
+        self.connect_timeout = connect_timeout
+        self.net_timeout = net_timeout
         self.set_server(server)
 
     def set_server(self, server):
@@ -107,7 +114,11 @@ class Client(object):
             2. Tuples of the form C{("host:port", weight)}, where C{weight} is
             an integer weight value.
         """
-        self.server = MemcachedConnection(server)
+        self.server = MemcachedConnection(
+            server,
+            connect_timeout=self.connect_timeout,
+            net_timeout=self.net_timeout
+        )
 
     def _get_server(self, key):
         if self.server.connect():
@@ -135,6 +146,9 @@ class Client(object):
 
     def _delete_send_cb(self, server, callback):
         return server.expect("DELETED",callback=partial(self._expect_cb, callback=callback))
+
+    def add(self, key, amount, clalback=None):
+        return self.incr(key, delta=amount, callback=callback)
 
     def incr(self, key, delta=1, callback=None):
         """
@@ -187,6 +201,12 @@ class Client(object):
     def _send_incrdecr_check_cb(self, line, callback):
         return self.finish(partial(callback,int(line)))
 
+    def append(self, key, val, time=0, callback=None):
+        return self._set("append", key, val, time, callback)
+
+    def prepend(self, key, val, time=0, callback=None):
+        return self._set("prepend", key, val, time, callback)
+
     def add(self, key, val, time=0, callback=None):
         '''
         Add new key with value.
@@ -197,6 +217,7 @@ class Client(object):
         @rtype: int
         '''
         return self._set("add", key, val, time, callback)
+
     def replace(self, key, val, time=0, callback=None):
         '''Replace existing key with value.
 
@@ -207,6 +228,10 @@ class Client(object):
         @rtype: int
         '''
         return self._set("replace", key, val, time, callback)
+
+    def cas(self, key, value, cas, time=0, callback=None):
+        return self._set("cas",key,value,time,callback,cas=cas)
+
     def set(self, key, val, time=0, callback=None):
         '''Unconditionally sets a key to a given value in the memcache.
 
@@ -221,7 +246,19 @@ class Client(object):
         '''
         return self._set("set", key, val, time, callback)
 
-    def _set(self, cmd, key, val, time, callback):
+    def set_many(self, values, time=0, callback=None):
+        for key,val in values.iteritems():
+            self.set(key,val,time=time,callback=lambda x: x)
+
+        return callback(None)
+
+    def delete_many(self, keys, callback=None):
+        for key in keys:
+            self.delete(key,callback=lambda x: x)
+
+        return callback(None)
+
+    def _set(self, cmd, key, val, time, callback, cas=None):
         server, key = self._get_server(key)
         if not server:
             self.finish(partial(callback,0))
@@ -240,9 +277,31 @@ class Client(object):
             # does. Ideally we should be raising an exception here.
             val = str(val)
 
-        fullcmd = "%s %s %d %d %d\r\n%s" % (cmd, key, flags, time, len(val), val)
+        extra = ''
+        if cas is not None:
+            extra += ' ' + cas
 
-        return server.send_cmd(fullcmd, callback=partial(self._set_send_cb, server=server, callback=callback))
+        fullcmd = "%s %s %d %d %d%s\r\n%s" % (cmd, key, flags, time, len(val), extra, val)
+        response = server.send_cmd(fullcmd, callback=partial(
+            self._set_send_cb, server=server, callback=callback))
+
+        response = response.strip()
+        if response == 'STORED':
+            return True
+        elif response == 'NOT_STORED':
+            return False
+        elif response == 'NOT_FOUND':
+            return None
+        elif response == 'EXISTS':
+            return False
+        else:
+            self.server.close()
+            raise AsyncMemcachedException("Unknown response")
+
+    def touch(self, key, time=0, callback=None):
+        server, key = self._get_server(key)
+        return server.send_cmd("touch %s %d" % (key, time),
+            callback=partial(self._set_send_cb, server=server, callback=callback)).startswith('TOUCHED')
 
     def _set_send_cb(self, server, callback):
         return server.expect("STORED", callback=partial(self._expect_cb, value=None, callback=callback))
@@ -258,18 +317,35 @@ class Client(object):
 
         return server.send_cmd("get %s" % key, partial(self._get_send_cb, server=server, callback=callback))
 
+    def get_many(self, keys, callback):
+        server, keys = self._get_server(keys)
+        return server.send_cmd('get' + ' ' + ' '.join(keys), partial(self._get_many_send_cb, server=server, callback=callback))
+
+    def _get_many_send_cb(self, server, callback):
+        return self._expectvalues(server, callback=partial(self._get_expectvals_cb, server=server, callback=callback))
+
     def _get_send_cb(self, server, callback):
         return self._expectvalue(server, line=None, callback=partial(self._get_expectval_cb, server=server, callback=callback))
 
-    def _get_expectval_cb(self, rkey, flags, rlen, server, callback):
+    def _get_expectval_cb(self, rkey, flags, rlen, done, server, callback):
         if not rkey:
             return self.finish(partial(callback,None))
         return self._recv_value(server, flags, rlen, partial(self._get_recv_cb, server=server, callback=callback))
 
+    def _get_expectvals_cb(self, rkey, flags, rlen, done, server, callback):
+        if not rkey:
+            return self.finish(partial(callback,(None,None,done)))
+        return self._recv_value(server, flags, rlen, partial(self._get_many_recv_cb, rkey=rkey, server=server, callback=callback))
+
     def _get_recv_cb(self, value, server, callback):
         return server.expect("END", partial(self._expect_cb, value=value, callback=callback))
 
-    def _expect_cb(self, expected=None, value=None, callback=None):
+    def _get_many_recv_cb(self, value, rkey, server, callback):
+        return rkey, self._expect_cb(value=value, callback=callback), False
+
+    def _expect_cb(self, read_value=None, value=None, callback=None):
+        if value is None:
+            value = read_value
         return self.finish(partial(callback,value))
 
     def _expectvalue(self, server, line=None, callback=None):
@@ -278,23 +354,33 @@ class Client(object):
         else:
             return self._expectvalue_cb(line, callback)
 
+    def _expectvalues(self, server, callback=None):
+        result = {}
+        while True:
+            key, val, done = server.readline(partial(self._expectvalue_cb, callback=callback))
+            if done:
+                break
+            result[key] = val
+        return result
+
     def _expectvalue_cb(self, line, callback):
-        if line[:5] == 'VALUE':
+        if line.startswith('VALUE'):
             resp, rkey, flags, len = line.split()
             flags = int(flags)
             rlen = int(len)
-            return callback(rkey, flags, rlen)
+            return callback(rkey, flags, rlen, False)
+        elif line.startswith('END'):
+            return callback(None, None, None, True)
         else:
-            return callback(None, None, None)
+            return callback(None, None, None, True)
 
     def _recv_value(self, server, flags, rlen, callback):
         rlen += 2 # include \r\n
         return server.recv(rlen, partial(self._recv_value_cb,rlen=rlen, flags=flags, callback=callback))
 
-
     def _recv_value_cb(self, buf, flags, rlen, callback):
         if len(buf) != rlen:
-            raise _Error("received %d bytes when expecting %d" % (len(buf), rlen))
+            raise AsyncMemcachedException("received %d bytes when expecting %d" % (len(buf), rlen))
 
         if len(buf) == rlen:
             buf = buf[:-2]  # strip \r\n
@@ -305,8 +391,6 @@ class Client(object):
             val = int(buf)
         elif flags & Client._FLAG_LONG:
             val = long(buf)
-        else:
-            self.debuglog("unknown flags on get: %x\n" % flags)
 
         return self.finish(partial(callback,val))
 
@@ -613,15 +697,15 @@ class GreenletBoundedSemaphore(GreenletSemaphore):
 
 class MemcachedConnection(object):
 
-    def __init__(self, host, io_loop=None):
+    def __init__(self, host, connect_timeout=5, net_timeout=5, io_loop=None):
         if host.find(":") > 0:
             self.ip, self.port = host.split(":")
             self.port = int(self.port)
         else:
             self.ip, self.port = host, 11211
 
-        self.conn_timeout = 5
-        self.net_timeout = 5
+        self.conn_timeout = connect_timeout
+        self.net_timeout = net_timeout
         self.socket = None
         self.timeout = None
         self.timeout_handle = None
@@ -647,7 +731,7 @@ class MemcachedConnection(object):
         self.socket = green_sock
         return green_sock
 
-    def close_socket(self):
+    def close(self):
         if self.socket:
             self.socket.close()
             self.socket = None
@@ -664,9 +748,7 @@ class MemcachedConnection(object):
         return self.readline(partial(self._expect_cb, text=text, callback=callback))
 
     def _expect_cb(self, data, text, callback):
-        if data.rstrip() != text:
-            self.debuglog("while expecting '%s', got unexpected response '%s'" % (text, data))
-        return callback(data)
+        return callback(read_value=data)
 
     def recv(self, rlen, callback):
         resp = self.socket.recv(rlen)
