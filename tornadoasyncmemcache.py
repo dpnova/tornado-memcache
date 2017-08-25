@@ -40,8 +40,8 @@ class MemcachedClient(object):
                  server,
                  pool_size=5,
                  wait_queue_timeout=5,
-                 connect_timeout=5,
-                 net_timeout=2):
+                 connect_timeout=2,
+                 net_timeout=1):
 
         self._server = server
         self._pool_size = pool_size
