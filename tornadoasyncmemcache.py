@@ -11,7 +11,7 @@ import functools
 import greenlet
 import logging
 import os
-
+import six
 """
     # Minimal example to show how to use the client. This is a lower level client
     # that only connects to a single host. Managing multiple connections is left up
@@ -748,7 +748,7 @@ class MemcachedConnection(object):
             self.socket = None
 
     def send_cmd(self, cmd, callback):
-        self.socket.write(cmd+"\r\n")
+        self.socket.write(six.text_type(cmd).encode('ascii')+b"\r\n")
         return callback()
 
     def readline(self, callback):
