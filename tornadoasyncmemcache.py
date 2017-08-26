@@ -144,23 +144,28 @@ class Client(object):
 
     def _get_server(self, key):
         if self.server.connect():
+            if isinstance(key, six.text_type):
+                key = key.encode('utf8')
+            elif isinstance(key, basestring):
+                key = key.encode('ascii')
+
             return self.server, key
 
     def reconnect(self):
         self.server.close()
         self.server.connect()
 
-    def delete(self, key, time=0, callback=None):
+    def delete(self, key, expire=0, callback=None):
         '''Deletes a key from the memcache.
 
         @return: Nonzero on success.
         @rtype: int
         '''
         server, key = self._get_server(key)
-        if time:
-            cmd = "delete %s %d" % (key, time)
+        if expire:
+            cmd = b"delete %s %d" % (key, expire)
         else:
-            cmd = "delete %s" % key
+            cmd = b"delete %s" % key
 
         return server.send_cmd(cmd, callback=partial(self._delete_send_cb,server, callback))
 
@@ -206,7 +211,7 @@ class Client(object):
 
     def _incrdecr(self, cmd, key, delta, callback):
         server, key = self._get_server(key)
-        cmd = "%s %s %d" % (cmd, key, delta)
+        cmd = b"%s %s %d" % (cmd, key, delta)
 
         return server.send_cmd(cmd, callback=partial(self._send_incrdecr_check_cb,server, callback))
 
@@ -216,13 +221,13 @@ class Client(object):
     def _send_incrdecr_check_cb(self, line, callback):
         return self.finish(partial(callback,int(line)))
 
-    def append(self, key, val, time=0, callback=None):
-        return self._set("append", key, val, time, callback)
+    def append(self, key, val, expire=0, callback=None):
+        return self._set("append", key, val, expire, callback)
 
-    def prepend(self, key, val, time=0, callback=None):
-        return self._set("prepend", key, val, time, callback)
+    def prepend(self, key, val, expire=0, callback=None):
+        return self._set("prepend", key, val, expire, callback)
 
-    def add(self, key, val, time=0, callback=None):
+    def add(self, key, val, expire=0, callback=None):
         '''
         Add new key with value.
 
@@ -231,9 +236,9 @@ class Client(object):
         @return: Nonzero on success.
         @rtype: int
         '''
-        return self._set("add", key, val, time, callback)
+        return self._set("add", key, val, expire, callback)
 
-    def replace(self, key, val, time=0, callback=None):
+    def replace(self, key, val, expire=0, callback=None):
         '''Replace existing key with value.
 
         Like L{set}, but only stores in memcache if the key already exists.
@@ -242,12 +247,12 @@ class Client(object):
         @return: Nonzero on success.
         @rtype: int
         '''
-        return self._set("replace", key, val, time, callback)
+        return self._set("replace", key, val, expire, callback)
 
-    def cas(self, key, value, cas, time=0, callback=None):
-        return self._set("cas",key,value,time,callback,cas=cas)
+    def cas(self, key, value, cas, expire=0, callback=None):
+        return self._set("cas",key,value,expire,callback,cas=cas)
 
-    def set(self, key, val, time=0, callback=None):
+    def set(self, key, val, expire=0, callback=None):
         '''Unconditionally sets a key to a given value in the memcache.
 
         The C{key} can optionally be an tuple, with the first element being the
@@ -259,11 +264,11 @@ class Client(object):
         @return: Nonzero on success.
         @rtype: int
         '''
-        return self._set("set", key, val, time, callback)
+        return self._set("set", key, val, expire, callback)
 
-    def set_many(self, values, time=0, callback=None):
+    def set_many(self, values, expire=0, callback=None):
         for key,val in values.iteritems():
-            self.set(key,val,time=time,callback=lambda x: x)
+            self.set(key,val,expire=expire,callback=lambda x: x)
 
         return callback(None)
 
@@ -273,7 +278,7 @@ class Client(object):
 
         return callback(None)
 
-    def _set(self, cmd, key, val, time, callback, cas=None):
+    def _set(self, cmd, key, val, expire, callback, cas=None):
         server, key = self._get_server(key)
 
         flags = 0
@@ -294,7 +299,7 @@ class Client(object):
         if cas is not None:
             extra += ' ' + cas
 
-        fullcmd = "%s %s %d %d %d%s\r\n%s" % (cmd, key, flags, time, len(val), extra, val)
+        fullcmd = b"%s %s %d %d %d%s\r\n%s" % (cmd, key, flags, expire, len(val), extra, val)
         response = server.send_cmd(fullcmd, callback=partial(
             self._set_send_cb, server=server, callback=callback))
 
@@ -311,9 +316,9 @@ class Client(object):
             self.server.close()
             raise AsyncMemcachedException("Unknown response")
 
-    def touch(self, key, time=0, callback=None):
+    def touch(self, key, expire=0, callback=None):
         server, key = self._get_server(key)
-        return server.send_cmd("touch %s %d" % (key, time),
+        return server.send_cmd(b"touch %s %d" % (key, expire),
             callback=partial(self._set_send_cb, server=server, callback=callback)).startswith('TOUCHED')
 
     def _set_send_cb(self, server, callback):
@@ -326,11 +331,11 @@ class Client(object):
         '''
         server, key = self._get_server(key)
 
-        return server.send_cmd("get %s" % key, partial(self._get_send_cb, server=server, callback=callback))
+        return server.send_cmd(b"get %s" % key, partial(self._get_send_cb, server=server, callback=callback))
 
     def get_many(self, keys, callback):
         server, keys = self._get_server(keys)
-        return server.send_cmd('get' + ' ' + ' '.join(keys), partial(self._get_many_send_cb, server=server, callback=callback))
+        return server.send_cmd(b'get' + b' ' + b' '.join(keys), partial(self._get_many_send_cb, server=server, callback=callback))
 
     def _get_many_send_cb(self, server, callback):
         return self._expectvalues(server, callback=partial(self._get_expectvals_cb, server=server, callback=callback))
@@ -748,7 +753,7 @@ class MemcachedConnection(object):
             self.socket = None
 
     def send_cmd(self, cmd, callback):
-        self.socket.write(six.text_type(cmd).encode('ascii')+b"\r\n")
+        self.socket.write(cmd+"\r\n")
         return callback()
 
     def readline(self, callback):
