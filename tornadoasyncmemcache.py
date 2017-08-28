@@ -510,15 +510,14 @@ class GreenletSocket(object):
 
     We only implement those socket methods actually used by pymongo.
     """
-    def __init__(self, sock, io_loop, use_ssl=False):
+    def __init__(self, sock, use_ssl=False):
         self.use_ssl = use_ssl
-        self.io_loop = io_loop
         self.timeout = None
         self.timeout_handle = None
         if self.use_ssl:
             raise Exception("SSL isn't supported")
         else:
-            self.stream = MemcachedIOStream(sock, io_loop=io_loop)
+            self.stream = MemcachedIOStream(sock, io_loop=IOLoop.current())
 
     def setsockopt(self, *args, **kwargs):
         self.stream.socket.setsockopt(*args, **kwargs)
@@ -734,7 +733,7 @@ class MemcachedConnection(object):
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        green_sock = GreenletSocket(sock, self.io_loop)
+        green_sock = GreenletSocket(sock)
 
         green_sock.settimeout(self.conn_timeout)
         green_sock.connect((self.ip, self.port))
