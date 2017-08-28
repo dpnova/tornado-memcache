@@ -212,7 +212,7 @@ class Client(object):
         server, key = self._get_server(key)
         cmd = b"%s %s %d" % (cmd, key, delta)
 
-        return server.send_cmd(cmd, callback=partial(self._send_incrdecr_check_cb,server, callback))
+        return server.send_cmd(cmd, callback=partial(self._send_incrdecr_cb,server, callback))
 
     def _send_incrdecr_cb(self, server, callback):
         return server.readline(callback=partial(self._send_incrdecr_check_cb, callback=callback))
