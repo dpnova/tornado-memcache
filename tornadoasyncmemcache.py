@@ -4,7 +4,8 @@ import sys
 import socket
 import time
 import types
-from tornado import iostream, ioloop
+from tornado import iostream
+from tornado.ioloop import IOLoop
 from functools import partial
 import collections
 import functools
@@ -119,9 +120,7 @@ class Client(object):
     _FLAG_INTEGER = 1<<1
     _FLAG_LONG    = 1<<2
 
-    def __init__(self, server, connect_timeout=5, net_timeout=5, io_loop=None):
-        io_loop = io_loop or ioloop.IOLoop.current()
-        self.io_loop = io_loop
+    def __init__(self, server, connect_timeout=5, net_timeout=5):
         self.connect_timeout = connect_timeout
         self.net_timeout = net_timeout
         self.set_server(server)
@@ -459,7 +458,7 @@ def green_sock_method(method):
         try:
             # Add timeout for closing non-blocking method call
             if self.timeout and not self.timeout_handle:
-                self.timeout_handle = self.io_loop.add_timeout(
+                self.timeout_handle = IOLoop.current().add_timeout(
                     time.time() + self.timeout, self._switch_and_close)
 
             # method is GreenletSocket.send(), recv(), etc. method() begins a
@@ -488,7 +487,7 @@ def green_sock_method(method):
 
             # Remove timeout handle if set, since we've completed call
             if self.timeout_handle:
-                self.io_loop.remove_timeout(self.timeout_handle)
+                IOLoop.current().remove_timeout(self.timeout_handle)
                 self.timeout_handle = None
 
             # disable the callback to raise exception in this greenlet on socket
@@ -597,14 +596,12 @@ class GreenletSemaphore(object):
         Tornado IOLoop+Greenlet-based Semaphore class
     """
 
-    def __init__(self, value=1, io_loop=None):
+    def __init__(self, value=1):
         if value < 0:
             raise ValueError("semaphore initial value must be >= 0")
         self._value = value
         self._waiters = []
         self._waiter_timeouts = {}
-
-        self._ioloop = io_loop if io_loop else ioloop.IOLoop.current()
 
     def _handle_timeout(self, timeout_gr):
         if len(self._waiters) > 1000:
@@ -642,8 +639,8 @@ class GreenletSemaphore(object):
             if timeout:
                 callback = functools.partial(self._handle_timeout, current)
                 self._waiter_timeouts[current] = \
-                        self._ioloop.add_timeout(time.time() + timeout,
-                                                 callback)
+                        IOLoop.current().add_timeout(time.time() + timeout,
+                                                     callback)
 
             # yield back to the parent, returning when someone releases the
             # semaphore
@@ -687,10 +684,10 @@ class GreenletSemaphore(object):
             # remove the timeout
             if waiting_gr in self._waiter_timeouts:
                 timeout = self._waiter_timeouts.pop(waiting_gr)
-                self._ioloop.remove_timeout(timeout)
+                IOLoop.current().remove_timeout(timeout)
 
             # schedule the waiting greenlet to try to acquire
-            self._ioloop.add_callback(waiting_gr.switch)
+            IOLoop.current().add_callback(waiting_gr.switch)
 
     def __exit__(self, t, v, tb):
         self.release()
@@ -713,7 +710,7 @@ class GreenletBoundedSemaphore(GreenletSemaphore):
 
 class MemcachedConnection(object):
 
-    def __init__(self, host, connect_timeout=5, net_timeout=5, io_loop=None):
+    def __init__(self, host, connect_timeout=5, net_timeout=5):
         if host.find(":") > 0:
             self.ip, self.port = host.split(":")
             self.port = int(self.port)
@@ -725,7 +722,6 @@ class MemcachedConnection(object):
         self.socket = None
         self.timeout = None
         self.timeout_handle = None
-        self.io_loop = io_loop if io_loop else ioloop.IOLoop.current()
 
     def connect(self):
         if self._get_socket():
