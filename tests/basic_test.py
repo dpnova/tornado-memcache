@@ -6,7 +6,6 @@ import tornado.ioloop
 import time
 import greenlet
 
-
 class BaseGreenletCase(tornado.testing.AsyncTestCase):
     '''Base Test case that wraps runs with greenlets
     '''
@@ -26,7 +25,7 @@ class BaseGreenletCase(tornado.testing.AsyncTestCase):
             if gr.dead:
                 break
             yield tornado.gen.moment
-        
+
 class BasicMemcachedTest(BaseGreenletCase):
     def test_basic(self):
         key = 'foo'
@@ -34,3 +33,14 @@ class BasicMemcachedTest(BaseGreenletCase):
         client = tornadoasyncmemcache.MemcachedClient('127.0.0.1')
         self.assertTrue(client.do('set', key, value))
         self.assertEqual(value, client.do('get', key))
+
+    def test_incr_decr(self):
+        key = 'foo'
+        value = 0
+        client = tornadoasyncmemcache.MemcachedClient('127.0.0.1')
+        self.assertTrue(client.do('set',key,value))
+        self.assertEqual(1, client.do('incr',key))
+        self.assertEqual(0, client.do('decr',key))
+
+if __name__ == '__main__':
+    tornado.testing.main()
