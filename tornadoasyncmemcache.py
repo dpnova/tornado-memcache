@@ -292,13 +292,17 @@ class Client(object):
         else:
             # A bit odd to silently string it, but that's what pymemcache
             # does. Ideally we should be raising an exception here.
-            val = str(val)
+            val = six.text_type(val).encode('ascii')
 
         extra = ''
         if cas is not None:
             extra += ' ' + cas
 
-        fullcmd = b"%s %s %d %d %d%s\r\n%s" % (cmd, key, flags, expire, len(val), extra, val)
+        fullcmd = (cmd + b' ' + key + b' ' + six.text_type(flags).encode('ascii') +
+                   b' ' + six.text_type(expire).encode('ascii') +
+                   b' ' + six.text_type(len(val)).encode('ascii') + extra +
+                   b'\r\n' + six.text_type(val).encode('ascii'))
+
         response = server.send_cmd(fullcmd, callback=partial(
             self._set_send_cb, server=server, callback=callback))
 
