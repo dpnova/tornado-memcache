@@ -295,7 +295,7 @@ class Client(object):
             val = six.text_type(val).encode('ascii')
 
         if not isinstance(val, six.binary_type):
-            data = six.text_type(data).encode('ascii')
+            val = six.text_type(val).encode('ascii')
 
         extra = ''
         if cas is not None:
