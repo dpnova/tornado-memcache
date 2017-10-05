@@ -294,6 +294,9 @@ class Client(object):
             # does. Ideally we should be raising an exception here.
             val = six.text_type(val).encode('ascii')
 
+        if not isinstance(val, six.binary_type):
+            data = six.text_type(data).encode('ascii')
+
         extra = ''
         if cas is not None:
             extra += ' ' + cas
@@ -301,7 +304,7 @@ class Client(object):
         fullcmd = (cmd + b' ' + key + b' ' + six.text_type(flags).encode('ascii') +
                    b' ' + six.text_type(expire).encode('ascii') +
                    b' ' + six.text_type(len(val)).encode('ascii') + extra +
-                   b'\r\n' + six.text_type(val).encode('ascii'))
+                   b'\r\n' + val)
 
         response = server.send_cmd(fullcmd, callback=partial(
             self._set_send_cb, server=server, callback=callback))
