@@ -80,7 +80,7 @@ class MemcachedClient(object):
                 raise Exception(
                     "Acquired semaphore without client in free list, something weird is happening")
             return self._execute_command(client, cmd, *args, **kwargs)
-        except IOError as e:
+        except socket.error, e:
             if e.message == 'Stream is closed':
                 client.reconnect()
                 return self._execute_command(client, cmd, *args, **kwargs)
@@ -545,14 +545,7 @@ class GreenletSocket(object):
 
     @green_sock_method
     def write(self, data):
-        # do the send on the underlying socket synchronously...
-        try:
-            self.stream.write(data, greenlet.getcurrent().switch)
-        except IOError as e:
-            raise socket.error(str(e))
-
-        if self.stream.closed():
-            raise socket.error("connection closed")
+        self.stream.write(data, greenlet.getcurrent().switch)
 
     def recv(self, num_bytes):
         # if we have enough bytes in our local buffer, don't yield
