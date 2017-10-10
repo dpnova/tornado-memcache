@@ -80,11 +80,6 @@ class MemcachedClient(object):
                 raise Exception(
                     "Acquired semaphore without client in free list, something weird is happening")
             return self._execute_command(client, cmd, *args, **kwargs)
-        except socket.error, e:
-            if e.message == 'Stream is closed':
-                client.reconnect()
-                return self._execute_command(client, cmd, *args, **kwargs)
-            raise
         finally:
             self._clients.append(client)
             self.pool.release()
@@ -149,6 +144,9 @@ class Client(object):
                 key = key.encode('ascii')
 
             return self.server, key
+
+    def disconnect(self):
+        self.server.close()
 
     def reconnect(self):
         self.server.close()
@@ -444,7 +442,7 @@ def green_sock_method(method):
         self.child_gr = greenlet.getcurrent()
         main = self.child_gr.parent
         assert main, "Using async client in non-async environment. Must be on a child greenlet"
-
+        self.disabled = False
         # Run on main greenlet
         def closed(gr):
             # The child greenlet might have died, e.g.:
@@ -455,7 +453,7 @@ def green_sock_method(method):
             # - PyMongo operation completed (with or without error) and
             #       its greenlet terminated
             # - IOLoop runs this function
-            if not gr.dead:
+            if not gr.dead and not self.disabled:
                 gr.throw(socket.error("Close called, killing memcached operation"))
 
         # send the error to this greenlet if something goes wrong during the
@@ -502,7 +500,7 @@ def green_sock_method(method):
             # in (and it'll be caught on the next query and raise an
             # AutoReconnect, which gets handled properly)
             self.stream.set_close_callback(None)
-
+            self.disabled = True
             def cleanup_cb():
                 self.stream.close()
 
@@ -535,7 +533,7 @@ class GreenletSocket(object):
     def _switch_and_close(self):
         # called on timeout to switch back to child greenlet
         self.close()
-        if self.child_gr is not None:
+        if self.child_gr is not None and not self.child_gr.dead:
             self.child_gr.throw(IOError("Socket timed out"))
 
     @green_sock_method
@@ -748,12 +746,20 @@ class MemcachedConnection(object):
             self.socket = None
 
     def send_cmd(self, cmd, callback):
-        self.socket.write(cmd+"\r\n")
-        return callback()
+        try:
+            self.socket.write(cmd+"\r\n")
+            return callback()
+        except socket.error:
+            self.close()
+            raise
 
     def readline(self, callback):
-        resp = self.socket.read_until("\r\n")
-        return callback(resp)
+        try:
+            resp = self.socket.read_until("\r\n")
+            return callback(resp)
+        except socket.error:
+            self.close()
+            raise
 
     def expect(self, text, callback):
         return self.readline(partial(self._expect_cb, text=text, callback=callback))
@@ -762,8 +768,12 @@ class MemcachedConnection(object):
         return callback(read_value=data)
 
     def recv(self, rlen, callback):
-        resp = self.socket.recv(rlen)
-        return callback(resp)
+        try:
+            resp = self.socket.recv(rlen)
+            return callback(resp)
+        except socket.error:
+            self.close()
+            raise
 
     def __str__(self):
         d = ''
