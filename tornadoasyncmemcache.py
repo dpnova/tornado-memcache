@@ -80,6 +80,11 @@ class MemcachedClient(object):
                 raise Exception(
                     "Acquired semaphore without client in free list, something weird is happening")
             return self._execute_command(client, cmd, *args, **kwargs)
+        except iostream.StreamClosedError:
+            client.reconnect()
+            return self._execute_command(client, cmd, *args, **kwargs)
+        except IOError as e:
+            raise socket.error(str(e))
         finally:
             self._clients.append(client)
             self.pool.release()
@@ -480,13 +485,8 @@ def green_sock_method(method):
             return socket_result
         except socket.error:
             raise
-        except IOError, e:
-            # If IOStream raises generic IOError (e.g., if operation
-            # attempted on closed IOStream), then substitute socket.error,
-            # since socket.error is what PyMongo's built to handle. For
-            # example, PyMongo will catch socket.error, close the socket,
-            # and raise AutoReconnect.
-            raise socket.error(str(e))
+        except IOError:
+            raise
         finally:
             # do this here in case main.switch throws
 
