@@ -501,10 +501,6 @@ def green_sock_method(method):
             # AutoReconnect, which gets handled properly)
             self.stream.set_close_callback(None)
             self.disabled = True
-            def cleanup_cb():
-                self.stream.close()
-
-            _check_deadline(cleanup_cb)
 
     return _green_sock_method
 
