@@ -524,6 +524,13 @@ class GreenletSocket(object):
         else:
             self.stream = MemcachedIOStream(sock, io_loop=IOLoop.current())
 
+    def switch_wraps(self):
+        current_greenlet = greenlet.getcurrent()
+        def wraps(*args, **kwargs):
+            if not self.disabled and not current_greenlet.dead:
+                current_greenlet.switch(*args, **kwargs)
+        return wraps
+
     def setsockopt(self, *args, **kwargs):
         self.stream.socket.setsockopt(*args, **kwargs)
 
@@ -539,11 +546,11 @@ class GreenletSocket(object):
     @green_sock_method
     def connect(self, pair):
         # do the connect on the underlying socket asynchronously...
-        self.stream.connect(pair, greenlet.getcurrent().switch)
+        self.stream.connect(pair, self.switch_wraps())
 
     @green_sock_method
     def write(self, data):
-        self.stream.write(data, greenlet.getcurrent().switch)
+        self.stream.write(data, self.switch_wraps())
 
     def recv(self, num_bytes):
         # if we have enough bytes in our local buffer, don't yield
@@ -557,11 +564,11 @@ class GreenletSocket(object):
     def recv_async(self, num_bytes):
         # do the recv on the underlying socket... come back to the current
         # greenlet when it's done
-        return self.stream.read_bytes(num_bytes, greenlet.getcurrent().switch)
+        return self.stream.read_bytes(num_bytes, self.switch_wraps())
 
     @green_sock_method
     def read_until(self, *args, **kwargs):
-        return self.stream.read_until(*args, callback=greenlet.getcurrent().switch, **kwargs)
+        return self.stream.read_until(*args, callback=self.switch_wraps(), **kwargs)
 
     def close(self):
         # since we're explicitly handling closing here, don't raise an exception
