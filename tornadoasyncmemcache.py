@@ -72,7 +72,7 @@ class MemcachedClient(object):
             self._clients = self._create_clients()
 
         if not self.pool.acquire(timeout=self._wait_queue_timeout):
-            raise WaitQueueTimeout('Timed out waiting for connection')
+            raise AsyncMemcachedException('Timed out waiting for connection')
 
         try:
             client = self._clients.popleft()
@@ -85,11 +85,6 @@ class MemcachedClient(object):
             return self._execute_command(client, cmd, *args, **kwargs)
         except IOError as e:
             raise socket.error(str(e))
-        except WaitQueueTimeout:
-            raise
-        except Exception:
-            client.reconnect()
-            raise
         finally:
             self._clients.append(client)
             self.pool.release()
@@ -97,8 +92,6 @@ class MemcachedClient(object):
     def _gen_cb(self, response, c, *args, **kwargs):
         return response
 
-class WaitQueueTimeout(Exception):
-    pass
 class AsyncMemcachedException(Exception):
     pass
 
