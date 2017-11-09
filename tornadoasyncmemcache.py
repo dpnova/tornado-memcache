@@ -85,6 +85,9 @@ class MemcachedClient(object):
             return self._execute_command(client, cmd, *args, **kwargs)
         except IOError as e:
             raise socket.error(str(e))
+        except Exception:
+            client.disconnect()
+            raise
         finally:
             self._clients.append(client)
             self.pool.release()
