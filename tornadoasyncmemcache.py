@@ -629,7 +629,11 @@ class GreenletSemaphore(object):
         if timeout_gr in self._waiter_timeouts:
             self._waiter_timeouts.pop(timeout_gr)
 
-        timeout_gr.switch()
+        try:
+            timeout_gr.switch()
+        except Exception:
+            # This greenlet is dead, don't worry about it anymore
+            return
 
     def acquire(self, blocking=True, timeout=None):
         if not blocking and timeout is not None:
