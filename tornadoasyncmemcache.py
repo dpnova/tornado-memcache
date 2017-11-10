@@ -82,8 +82,20 @@ class MemcachedClient(object):
             return self._execute_command(client, cmd, *args, **kwargs)
         except iostream.StreamClosedError:
             client.reconnect()
-            return self._execute_command(client, cmd, *args, **kwargs)
+            try:
+                return self._execute_command(client, cmd, *args, **kwargs)
+            # Need to always close the socket on any unclean exit, that way
+            # there's no buffered data that will be read on the next op
+            except IOError as e:
+                client.disconnect()
+                raise socket.error(str(e))
+            except Exception:
+                client.disconnect()
+                raise
+        # Need to always close the socket on any unclean exit, that way
+        # there's no buffered data that will be read on the next op
         except IOError as e:
+            client.disconnect()
             raise socket.error(str(e))
         except Exception:
             client.disconnect()
