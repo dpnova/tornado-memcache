@@ -81,8 +81,8 @@ class MemcachedClient(object):
                     "Acquired semaphore without client in free list, something weird is happening")
             return self._execute_command(client, cmd, *args, **kwargs)
         except iostream.StreamClosedError:
-            client.reconnect()
             try:
+                client.reconnect()
                 return self._execute_command(client, cmd, *args, **kwargs)
             # Need to always close the socket on any unclean exit, that way
             # there's no buffered data that will be read on the next op
