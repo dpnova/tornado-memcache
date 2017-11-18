@@ -52,6 +52,16 @@ class MemcachedClient(object):
 
         self._clients = self._create_clients()
         self.pool = GreenletBoundedSemaphore(self._pool_size)
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+        while True:
+            try:
+                client = self._clients.pop()
+                client.disconnect()
+            except IndexError:
+                break
 
     def _create_clients(self):
         return collections.deque([
@@ -101,7 +111,10 @@ class MemcachedClient(object):
             client.disconnect()
             raise
         finally:
-            self._clients.append(client)
+            if self.closed:
+                client.disconnect()
+            else:
+                self._clients.append(client)
             self.pool.release()
 
     def _gen_cb(self, response, c, *args, **kwargs):
