@@ -438,9 +438,9 @@ class Client(object):
         if len(buf) == rlen:
             buf = buf[:-2]  # strip \r\n
 
-        if flags == 0:
-            val = buf
-        elif flags & Client._FLAG_INTEGER:
+        # default to raw value
+        val = buf
+        if flags & Client._FLAG_INTEGER:
             val = int(buf)
         elif flags & Client._FLAG_LONG:
             val = long(buf)
