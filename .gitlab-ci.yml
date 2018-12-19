@@ -16,7 +16,7 @@ upload_egg:
     - (if [ "$(sed -n "/.*\(version\).*=.*/p" setup.py | sed -e 's/^.*[^0-9]\([0-9]*\.[0-9]*\).*$/\1/' | wc -l)" == "1" ]; then echo "Found the version number"; else echo "Fail"; exit 33; fi);
     # update version to put custom ContextLogic version
     - version_origin=$(sed -n "/.*\(version\).*=.*/p" setup.py | sed -e 's/^.*[^0-9]\([0-9]*\.[0-9]*\).*$/\1/')
-    - version_cl="$version_origin+cl$CI_PIPELINE_ID"
+    - version_cl="'$version_origin+cl$CI_PIPELINE_ID'"
     - sed -i "s/$version_origin/$version_cl/g" setup.py
     - pip install .
     - pip show TornadoAsyncMemcache
