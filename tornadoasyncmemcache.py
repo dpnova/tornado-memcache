@@ -249,6 +249,9 @@ class Client(object):
         return server.readline(callback=partial(self._send_incrdecr_check_cb, callback=callback))
 
     def _send_incrdecr_check_cb(self, line, callback):
+        response = line.strip()
+        if response == "NOT_FOUND":
+            return self.finish(partial(callback,None))
         return self.finish(partial(callback,int(line)))
 
     def append(self, key, val, expire=0, callback=None):
