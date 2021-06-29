@@ -420,7 +420,9 @@ class Client(object):
         return result
 
     def _expectvalue_cb(self, line, callback):
-        if line.startswith('VALUE'):
+        if isinstance(line, basestring):
+            return callback(None, None, None, True)
+        elif line.startswith('VALUE'):
             resp, rkey, flags, len = line.split()
             flags = int(flags)
             rlen = int(len)
