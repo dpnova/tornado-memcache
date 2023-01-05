@@ -26,3 +26,18 @@ upload_egg:
     - twine upload --repository-url $PYPI_SERVER --username $USERNAME --password $PASSWORD dist/*
   only:
     - master
+
+publish-to-pypi:
+  image: registry-gitlab.i.wish.com/contextlogic/tooling-image/python/master:latest
+  before_script:
+    - source /ci/get-ci.sh
+  script:
+    - cd pypi
+    - pip install twine
+    - (if [[ -z $(twine check dist/* | grep -iF "error") ]]; then echo "Distribution Valid!"; else echo "Distribution Invalid."; exit 33; fi);
+    - twine upload --repository-url $ITA_PYPI_REPOSITORY_URL --username $$USERNAME --password $PASSWORD dist/*
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+      changes:
+        - pypi/**/*
+        - gen/**/*
