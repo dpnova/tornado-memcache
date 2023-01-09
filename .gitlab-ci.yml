@@ -24,5 +24,3 @@ upload_egg:
     - pip install twine
     - python setup.py sdist
     - twine upload --repository-url $PYPI_SERVER --username $USERNAME --password $PASSWORD dist/*
-  only:
-    - master
