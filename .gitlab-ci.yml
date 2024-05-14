@@ -1,0 +1,8 @@
+publish-to-pypi:
+  image: registry-gitlab.i.wish.com/contextlogic/tooling-image/python/master:latest
+  before_script:
+    - source /ci/get-ci.sh
+  script:
+    - pip install twine
+    - python setup.py sdist
+    - twine upload --repository-url $PYPI_SERVER --username tornado-memcache --password blwSbVKqB2H02i1WO8v7PMqW0R_aE6OV dist/* --verbose
